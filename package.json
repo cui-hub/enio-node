@@ -1,0 +1,48 @@
+{
+  "name": "enio-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A small, documented single-agent runtime inspired by Eino",
+  "type": "module",
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "packageManager": "pnpm@12.11.2",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "ENIO_LIVE_TEST=1 vitest run tests/live.test.ts",
+    "demo": "tsx examples/file-report.ts",
+    "demo:business": "tsx examples/business-tool.ts",
+    "demo:live": "tsx examples/file-report.ts --live",
+    "check": "pnpm run format:check && pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "openai": "7.34.0",
+    "picomatch": "4.0.7",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "@types/picomatch": "4.0.3",
+    "prettier": "3.9.10",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

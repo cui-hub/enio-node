@@ -1,0 +1,9 @@
+engineStrict: true
+savePrefix: ""
+# tsx 使用 esbuild；只允许锁定版本的二进制安装脚本。
+allowBuilds:
+  esbuild@0.28.2: true
+minimumReleaseAgeExclude:
+  - "@vitest/mocker@5.0.5"
+  - "@vitest/spy@5.0.5"
+  - vitest@5.0.5
