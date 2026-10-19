@@ -1,6 +1,8 @@
 # enio-node
 
-Node.js + TypeScript 单 Agent SDK，参考 Eino 的模型／工具循环和扩展边界实现。项目名按约定使用 **enio-node**；它是独立实现，不是 Eino 官方 TypeScript 版本。
+用于学习 Agent 框架设计的 Node.js + TypeScript 单 Agent SDK，参考 [Eino](https://github.com/cloudwego/eino) 的模型／工具循环和扩展边界实现。项目名按约定使用 **enio-node**；它是独立实现，不是 Eino 官方 TypeScript 版本。
+
+项目仓库：[cui-hub/enio-node](https://github.com/cui-hub/enio-node)。建议结合源码注释、架构文档和离线示例理解模型调用、工具执行与运行时控制的完整链路。
 
 一期已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、inline Skill，以及显式启用的命令执行扩展。子 Agent、Graph、Workflow、检查点恢复和审批留到后续阶段。
 
@@ -40,7 +42,7 @@ nvm use "$task_node_before"
 
 ## 最小接入
 
-先构建，再从 `dist/index.js` 引入；未来发布时可以改用正式包名。当前 package 为 private，不会误发布到公共仓库。
+先构建，再从 `dist/index.js` 引入；未来发布时可以改用正式包名。当前 `package.json` 设置 `private: true` 以防止误发布到 npm，不影响 GitHub 源码公开。
 
 ```typescript
 import { createAgent, createScriptedModel, defineTool } from "./dist/index.js";
@@ -183,6 +185,6 @@ for await (const event of agent.stream(
 
 - [架构与扩展方式](docs/architecture.md)：模块依赖、循环和取消链路。
 - [验收记录](docs/acceptance.md)：一期 A01–A14 对应测试与未验证部分。
-- [技术方案](https://bytedance.larkoffice.com/docx/BBlHd6EVNolOv9xCNZ5cheqYnre)：需求范围与后续分期。
+- [Eino 源码](https://github.com/cloudwego/eino)：参考框架，可对照理解 Go 与 TypeScript 的实现方式。
 
 核心代码配有中文 JSDoc，说明公开类型、执行阶段、权限边界和失败语义。构建产物由 tsc 生成，不手改 `dist/`。
