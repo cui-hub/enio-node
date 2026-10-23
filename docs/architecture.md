@@ -8,6 +8,10 @@ flowchart TD
   Runtime --> Protocol[protocol 类型与错误]
   Runtime --> Registry[ToolRegistry / ToolExecutor]
   Runtime --> Model[ChatModel 接口]
+  Runtime --> Instructions[AgentsMdLoader 接口]
+  AgentsMd[createAgentsMd / 引用与预算] -.实现.-> Instructions
+  AgentsMd --> InstructionBackend[AgentsMdBackend read]
+  InstructionBackend --> Local
   Provider[OpenAI-compatible / ScriptedModel] -.实现.-> Model
   Files[文件工具] -.注册.-> Registry
   Todo[待办工具] -.注册.-> Registry
@@ -36,6 +40,8 @@ flowchart TD
 | src/backends/local-filesystem.ts   | 路径分量校验、受限读取、排他创建和原子替换         |
 | src/backends/memory.ts             | 可重复的离线存储实现                               |
 | src/skills/skills.ts               | 元数据发现、inline 正文加载和配置拒绝              |
+| src/instructions/agents-md.ts      | 项目指令来源协议、引用展开、去重、告警与字节预算   |
+| src/backends/local-agents-md.ts    | 把 LocalFileStore 接入项目指令加载器               |
 | src/backends/process.ts            | 显式授权、shell=false、有界输出和进程组清理        |
 
 ## 循环及不变量
@@ -45,6 +51,37 @@ flowchart TD
 整个批次在开始副作用前检查编号重复、数量上限和参数体积。单个调用参数错误允许回填并继续，取消或致命错误停止余下调用，保留未完成编号。没有工具的正常模型回复才生成 completed；一期没有 returnDirectly。
 
 工具和 provider 都不直接修改消息历史。固定 instructions 只在每次请求组装时加入，不写入历史，因此宿主复用历史时不会重复累计指令。业务 context 可包含客户端，Runner 不克隆客户端；上下文类型只读，业务不应在并发 run 中修改共享身份。
+
+## AGENTS.md 项目指令链路
+
+```mermaid
+sequenceDiagram
+  participant Host as 业务宿主
+  participant Run as Agent Loop
+  participant Loader as AgentsMdLoader
+  participant Backend as AgentsMdBackend
+  participant Model as ChatModel
+  Host->>Run: run / 消费 stream
+  Run->>Run: 验证输入和历史，创建运行取消域
+  Run->>Loader: load(run signal)，本次 run 仅一次
+  loop 入口文件和递归引用，预算内
+    Loader->>Backend: read(根目录内相对路径, signal)
+    Backend-->>Loader: UTF-8 原始文本
+  end
+  Loader-->>Run: 带来源标题的合并文本
+  loop 模型与工具循环
+    Run->>Run: 复制历史，在首条 user 前插入项目指令
+    Run->>Model: system 指令 + 项目指令 + 对话及工具结果
+    Model-->>Run: assistant 响应
+  end
+  Run-->>Host: RunResult，历史不包含注入文本
+```
+
+`AgentConfig.agentsMd` 只依赖 `protocol/types.ts` 中的加载器契约，runtime 不导入文件系统。`createAgentsMd` 负责来源顺序、相对引用、循环检测、UTF-8 截断与告警；`createFilesystemAgentsMd` 使用 `LocalFileStore` 提供受限本地读取。项目指令无需工具调用，因此不进入工具注册表，不消耗工具调用次数，也不走工具参数校验或 `allowTool`。加载用的 ACL 由宿主所选 backend 提供。
+
+缓存是 engine 的局部变量，而不是加载器或 Agent 的共享状态。首次模型请求之前加载一次，后续轮次和网络重试复用；同一 Agent 的下一次 run 重新读取。缺失／空结果也在当前 run 固定，避免工具中途创建文件导致规则悄然改变。模型请求和返回历史分开维护，复用历史不会累积指令副本；注入文本计入 `maxInputBytes`。
+
+对齐 Eino `adk/middlewares/agentsmd` 的核心行为：显式配置来源、递归引用、运行内复用和临时 user 消息。当前实现更明确地限制本地工作区范围，不自动搜索祖先目录；文件总数有上限，默认启用字节预算，最终文本的标题和截断提示也计入预算。没有通用中间件框架，也没有复制 Eino 的 RunLocal/State API。
 
 ## 取消和资源生命周期
 

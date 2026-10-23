@@ -28,6 +28,7 @@
     "test:live": "ENIO_LIVE_TEST=1 vitest run tests/live.test.ts",
     "demo": "tsx examples/file-report.ts",
     "demo:business": "tsx examples/business-tool.ts",
+    "demo:instructions": "tsx examples/project-instructions.ts",
     "demo:live": "tsx examples/file-report.ts --live",
     "check": "pnpm run format:check && pnpm run typecheck && pnpm run test && pnpm run build"
   },

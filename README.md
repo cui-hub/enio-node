@@ -4,7 +4,7 @@
 
 项目仓库：[cui-hub/enio-node](https://github.com/cui-hub/enio-node)。建议结合源码注释、架构文档和离线示例理解模型调用、工具执行与运行时控制的完整链路。
 
-一期已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、inline Skill，以及显式启用的命令执行扩展。子 Agent、Graph、Workflow、检查点恢复和审批留到后续阶段。
+一期已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、inline Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。子 Agent、Graph、Workflow、检查点恢复和审批留到后续阶段。
 
 ## 快速运行
 
@@ -22,6 +22,7 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm run check
 corepack pnpm run demo
 corepack pnpm run demo:business
+corepack pnpm run demo:instructions
 
 nvm use "$task_node_before"
 ```
@@ -142,6 +143,55 @@ const agent = createAgent({
 
 读取按行分页，每次最多 24 KiB；单行超长时也会截断，一期不提供该行的字节偏移续读。目录列举可返回用于导航的非敏感目录名；可读文件由 readable 限制，`.git`、`.env` 等默认排除。
 
+## 加载 AGENTS.md 项目指令
+
+通过 `agentsMd` 显式启用后，每次运行会自动读取选定工作区的 `AGENTS.md`，无需模型先调用文件工具。文件名可配置，因此也能读取 `CLAUDE.md` 或业务自己的规范文件。`createAgent` 本身仍是同步工厂，文件读取发生在 `run` 或消费 `stream` 后、首次模型请求之前。
+
+```typescript
+import { createAgent, createFilesystemAgentsMd } from "./dist/index.js";
+
+const agent = createAgent({
+  model,
+  instructions: "你是一个文件任务助手。",
+  agentsMd: createFilesystemAgentsMd({
+    root: workspace, // 宿主明确选择工作区，不隐式使用 process.cwd()
+    files: ["AGENTS.md"], // 默认就是此值；可按顺序补充 docs/AGENTS.md 等
+    maxFileBytes: 16_384,
+    maxTotalBytes: 32_768,
+    onWarning: ({ file, code }) => console.warn(`项目指令 ${file}: ${code}`),
+  }),
+  tools: [...createFileTools({ backend })],
+});
+```
+
+AGENTS.md 中可引用其他文件，例如：
+
+```markdown
+本项目使用 pnpm，修改代码后运行相关检查。
+@docs/testing.md
+```
+
+引用相对所在文件解析，按深度优先顺序展开，去重并跳过引用环。`../shared.md` 可以引用工作区内的兄弟文件，越出 `root`、绝对路径及符号链接会被拒绝。引用路径不支持空格；`@owner`、邮箱不会展开，代码块里的 `@docs/rules.md` 也会被识别。引用文本保留在正文中，被引用文件带来源标题单独追加。
+
+沿用 Eino `agentsmd` 中间件的消息语义：合并文本作为一条临时 **user 消息**，插到第一条已有 user 消息之前；`instructions` 和 `beforeModel` 返回的内容仍为 system 消息。项目指令只进入模型请求，**不写入 `RunResult.messages`**。同一 run 的各轮和重试使用同一份内容，空结果也缓存；下次 run 重新读取，并发 run 独立加载。启用加载器不会注册任何工具；Skill 仍通过 `createSkillTool` 注册到 `tools`。
+
+| 项目           | 默认行为                                                                        |
+| -------------- | ------------------------------------------------------------------------------- |
+| 入口与目录范围 | 读取 `root/AGENTS.md`；多个入口按 `files` 顺序；空数组禁用读取                  |
+| 引用范围       | 无空格的 `@路径`，含 `/` 或扩展名为 `.md/.txt/.mdx/.yaml/.yml/.json/.toml`      |
+| 加载预算       | 单文件正文 16 KiB；最终文本 32 KiB，包含来源标题和截断提示；UTF-8 边界截断      |
+| 遍历预算       | 引用深度 5；最多尝试 128 个不同路径，包含缺失文件；`maxImportDepth: 0` 关闭展开 |
+| 缺失／空文件   | 跳过；缺失文件可通过 `onWarning` 观察，默认静默                                 |
+| 读取失败       | 权限、非文本、非法路径等终止运行；首次模型请求不会发出                          |
+| 截断／预算耗尽 | 提供告警；被截断文件不展开引用，总预算或文件数耗尽后停止后续读取                |
+| 取消与超时     | 使用当前 run 的 signal 和总超时；不受工具超时控制，不进行加载重试               |
+
+本地存储另有单文件 **1 MiB 原始读取上限**，超过时失败；这个上限与注入文本截断预算是两回事。最终模型请求仍受 `maxInputBytes` 约束。字节和文件数预算必须为正整数，不用 `0` 表示无限；只有引用深度允许 `0`。
+
+这一版由宿主决定文件作用域：不自动向父目录搜索，也不根据工具正在访问的目录自动切换子目录规则。若显式列出 `docs/AGENTS.md`，其内容会用于整个 run。加载器只读取和注入文本，不执行其中的脚本。项目指令读取与文件工具的 `readable` 白名单独立，允许范围由加载器的 `root` 和 backend 决定；业务需要额外 ACL 时，使用 `createAgentsMd({ backend: { read(file, signal) { ... } } })` 提供自定义读取实现。
+
+完整可运行示例：[examples/project-instructions.ts](examples/project-instructions.ts)，执行 `pnpm run demo:instructions`；示例使用真实临时文件和确定性模型，不需要 API Key，并在结束时清理目录。
+
 ## 流式事件与运行结果
 
 ```typescript
@@ -184,7 +234,7 @@ for await (const event of agent.stream(
 ## 源码阅读
 
 - [架构与扩展方式](docs/architecture.md)：模块依赖、循环和取消链路。
-- [验收记录](docs/acceptance.md)：一期 A01–A14 对应测试与未验证部分。
+- [验收记录](docs/acceptance.md)：一期 A01–A15 对应测试与未验证部分。
 - [Eino 源码](https://github.com/cloudwego/eino)：参考框架，可对照理解 Go 与 TypeScript 的实现方式。
 
 核心代码配有中文 JSDoc，说明公开类型、执行阶段、权限边界和失败语义。构建产物由 tsc 生成，不手改 `dist/`。

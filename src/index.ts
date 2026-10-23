@@ -26,3 +26,11 @@ export type {
   ProcessBackendOptions,
 } from "./backends/process.js";
 export * from "./skills/skills.js";
+export { createAgentsMd } from "./instructions/agents-md.js";
+export type {
+  AgentsMdBackend,
+  AgentsMdOptions,
+  AgentsMdWarning,
+} from "./instructions/agents-md.js";
+export { createFilesystemAgentsMd } from "./backends/local-agents-md.js";
+export type { FilesystemAgentsMdOptions } from "./backends/local-agents-md.js";

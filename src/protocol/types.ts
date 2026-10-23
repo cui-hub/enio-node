@@ -169,10 +169,20 @@ export interface Hooks<C> {
   onEvent?(event: AgentEvent): void | Promise<void>;
 }
 
+/**
+ * 项目指令来源。Runner 每次 run 首轮请求前调用一次，后续轮次复用返回的文本。
+ * 实现必须向 I/O 传播 signal；返回空文本表示没有项目指令，不向历史写入内容。
+ */
+export interface AgentsMdLoader {
+  load(signal: AbortSignal): Promise<string>;
+}
+
 /** 可复用配置；具体 Skill 工具通过工厂显式注册，避免异步隐式初始化。 */
 export interface AgentConfig<C> {
   model: ChatModel;
   instructions?: string;
+  /** 可选项目指令加载器；按 Eino 的方式作为临时 user 消息注入模型请求。 */
+  agentsMd?: AgentsMdLoader;
   tools?: Tool<unknown, C>[];
   limits?: Partial<Limits>;
   hooks?: Hooks<C>;

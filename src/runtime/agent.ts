@@ -26,6 +26,10 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
   const config = { ...configuration, hooks: { ...configuration.hooks } };
   if (typeof config.model?.generate !== "function")
     throw new AgentError("invalid_config", "A ChatModel is required");
+  if (config.agentsMd !== undefined && typeof config.agentsMd?.load !== "function")
+    throw new AgentError("invalid_config", "agentsMd.load must be a function");
+  // 保留接收者，以支持 class 实现；创建 Agent 本身不读取文件。
+  const loadAgentsMd = config.agentsMd?.load.bind(config.agentsMd);
   const baseLimits = resolveLimits(config.limits);
   const registry = new ToolRegistry(config.tools ?? []);
 
@@ -89,6 +93,18 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
       inputValid = true;
       messages.push({ role: "user", content: input.input });
 
+      // 每个 run 独立加载一次（空结果也缓存）。文件改动从下次 run 生效，
+      // 不共享跨 run 的 Promise，避免并发运行串用内容或取消信号。
+      const projectInstructions = loadAgentsMd
+        ? await abortable(
+            Promise.resolve().then(() => loadAgentsMd(scope.signal)),
+            scope.signal,
+          )
+        : "";
+      checkAbort(scope.signal);
+      if (typeof projectInstructions !== "string")
+        throw new AgentError("invalid_agents_md", "agentsMd.load must return text");
+
       while (true) {
         checkAbort(scope.signal);
         if (iteration >= limits.maxIterations)
@@ -111,6 +127,15 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             throw new AgentError("invalid_hook", "beforeModel must return text or void");
         }
         const request = { messages: structuredClone(messages), tools: registry.definitions() };
+        // 与 Eino agentsmd 对齐：插在首条 user 消息之前，保留 system 的优先级。
+        // 只修改请求快照，避免恢复历史时累积副本，也不会拆开 assistant/tool 配对。
+        if (projectInstructions.trim()) {
+          const firstUser = request.messages.findIndex((message) => message.role === "user");
+          request.messages.splice(firstUser < 0 ? request.messages.length : firstUser, 0, {
+            role: "user",
+            content: projectInstructions,
+          });
+        }
         // 固定指令只组装进请求，不重复写入可复用历史，避免多次 run 累积副本。
         if (config.instructions)
           request.messages.unshift({ role: "system", content: config.instructions });
