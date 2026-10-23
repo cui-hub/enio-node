@@ -8,6 +8,8 @@ import {
   truncateUtf8,
 } from "../runtime/control.js";
 import type { ToolRegistry } from "./registry.js";
+import { ToolInterrupt } from "../runtime/interrupt.js";
+import { assertJson } from "../runtime/state.js";
 
 /** 保留有效的外层 JSON 信封；预算包含 JSON 转义，不只计算原字符串字节数。 */
 export function normalizeToolResult(value: ToolResult, maximum: number): ToolResult {
@@ -31,7 +33,17 @@ export function normalizeToolResult(value: ToolResult, maximum: number): ToolRes
       code: truncateUtf8(value.code, 64),
       message: value.message,
       retryableByModel: value.retryableByModel,
+      ...(value.truncated ? { truncated: true } : {}),
     };
+  }
+  if (value.artifact) {
+    if (
+      !/^[a-f0-9-]{36}$/.test(value.artifact.id) ||
+      !Number.isSafeInteger(value.artifact.bytes) ||
+      value.artifact.bytes < 0
+    )
+      throw new AgentError("invalid_tool_result", "Invalid artifact reference");
+    result.artifact = { id: value.artifact.id, bytes: value.artifact.bytes };
   }
   if (byteLength(result) <= maximum) return result;
   const original = result.ok ? result.content : result.message;
@@ -61,6 +73,8 @@ export async function executeTool<C>(
   const scope = createScope(context.signal, limits.toolTimeoutMs, "tool_timeout");
   const ctx = { ...context, signal: scope.signal };
   let sideEffectStarted = false;
+  let executionStarted = false;
+  let toolFinished = false;
   try {
     checkAbort(scope.signal);
     const { tool, args } = registry.prepare(call.name, call.arguments);
@@ -88,9 +102,16 @@ export async function executeTool<C>(
       );
       if (allowed === false)
         throw new ToolError("permission_denied", "beforeTool denied this call", false);
+      if (allowed && typeof allowed === "object") {
+        if (allowed.type !== "interrupt")
+          throw new AgentError("invalid_hook", "Invalid beforeTool response");
+        assertJson(allowed.info);
+        throw new ToolInterrupt(structuredClone(allowed.info));
+      }
     }
     checkAbort(scope.signal);
     sideEffectStarted = tool.effect !== "read";
+    executionStarted = true;
     const result = await abortable(
       Promise.resolve().then(() => {
         checkAbort(scope.signal);
@@ -99,10 +120,30 @@ export async function executeTool<C>(
       scope.signal,
     );
     checkAbort(scope.signal);
-    return normalizeToolResult(result, limits.maxToolResultBytes);
+    toolFinished = true;
+    // 先验证结果形状，再让外置策略读取完整文本，最后应用硬性输出上限。
+    let transformed = normalizeToolResult(result, Number.MAX_SAFE_INTEGER);
+    for (const policy of config.contextPolicies ?? []) {
+      if (!policy.afterTool) continue;
+      transformed = await abortable(
+        Promise.resolve().then(() =>
+          policy.afterTool!({
+            runId: context.runId,
+            call: structuredClone(call),
+            result: structuredClone(transformed),
+            signal: scope.signal,
+            maxResultBytes: limits.maxToolResultBytes,
+          }),
+        ),
+        scope.signal,
+      );
+      transformed = normalizeToolResult(transformed, Number.MAX_SAFE_INTEGER);
+    }
+    return normalizeToolResult(transformed, limits.maxToolResultBytes);
   } catch (error) {
+    if (!scope.signal.aborted && !executionStarted && error instanceof ToolInterrupt) throw error;
     // 取消优先于迟到的业务错误，避免超时后又进入下一轮重试写操作。
-    if (!scope.signal.aborted && error instanceof ToolError) {
+    if (!scope.signal.aborted && !toolFinished && error instanceof ToolError) {
       return normalizeToolResult(
         {
           ok: false,

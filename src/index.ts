@@ -34,3 +34,18 @@ export type {
 } from "./instructions/agents-md.js";
 export { createFilesystemAgentsMd } from "./backends/local-agents-md.js";
 export type { FilesystemAgentsMdOptions } from "./backends/local-agents-md.js";
+export { createSummarization } from "./context/summarization.js";
+export type { SummarizationOptions } from "./context/summarization.js";
+export { createToolResultReduction } from "./context/reduction.js";
+export type { ToolReductionOptions } from "./context/reduction.js";
+export { estimateTokens } from "./context/shared.js";
+export type { TokenCounter } from "./context/shared.js";
+export { createArtifactTool } from "./builtins/artifacts.js";
+export {
+  createMemoryArtifactStore,
+  createFileArtifactStore,
+  createMemoryCheckpointStore,
+  createFileCheckpointStore,
+} from "./backends/context-stores.js";
+export { exportState, serializeState, parseState } from "./runtime/state.js";
+export { interrupt } from "./runtime/interrupt.js";
