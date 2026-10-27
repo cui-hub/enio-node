@@ -1,6 +1,8 @@
 # 长上下文、状态导出与中断恢复
 
-本阶段在单 Agent Loop 上增加可组合的上下文策略与持久化恢复。机制参考本工作区 Eino 的 `adk/middlewares/summarization`、`reduction`、`handler.go` 和 `runner.go`。这是独立 TypeScript 实现，API 和部分默认值不同，不提供 Go 检查点格式兼容性，也没有引入子 Agent、Workflow 或 Graph。
+V2 在单 Agent Loop 上增加可组合的上下文策略与持久化恢复。机制参考本工作区 Eino 的 `adk/middlewares/summarization`、`reduction`、`handler.go` 和 `runner.go`。这是独立 TypeScript 实现，API 和部分默认值不同，不提供 Go 检查点格式兼容性，也没有引入子 Agent、Workflow 或 Graph。
+
+V3 保留本页接入方式，并增加中间件、流式工具、并发读取、直接返回和主模型切换，详见 [V3 单 Agent 指南](v3-single-agent.md)。启用并发时，中断会等待同批读取收尾，已完成结果仍不会重放；检查点另保存模型选择、动态装配签名和本轮工具可见范围。
 
 ## 三种状态的边界
 
@@ -125,7 +127,7 @@ sequenceDiagram
   Loop-->>Host: completed + 工作快照
 ```
 
-启用检查点时，每次 run/resume 都要求宿主提供 `checkpointOwner`。检查点绑定该值、namespace、指令、工具定义与 effect、策略名称；错误身份或配置不能领取它。业务 context 不序列化，恢复时重新注入。函数实现和策略详细配置无法可靠哈希，改变这些逻辑或 Backend 时必须升级 namespace。
+启用检查点时，每次 run/resume 都要求宿主提供 `checkpointOwner`。检查点绑定该值、namespace、指令、工具定义与 effect、策略名称，以及启用的 V3 中间件名称、并发度、工具行为和备用模型数量；静态绑定不匹配时不能领取。V3 beforeAgent 的动态装配在领取后另行校验，一旦不匹配，该检查点已被消费，详见 V3 指南。业务 context 不序列化，恢复时重新注入。函数实现和策略详细配置无法可靠哈希，改变这些逻辑或 Backend 时必须升级 namespace。
 
 `CheckpointStore.take` 的契约是校验绑定后原子消费。同一检查点只能被一次 resume 领取。内存实现适合测试；文件实现通过排他创建 `.claimed` 防止多个进程同时恢复。文件 `.json` 和 `.claimed` 保留供诊断，TTL 与清理由业务管理。不要把检查点目录注册为模型可读写工作区。
 

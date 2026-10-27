@@ -98,6 +98,15 @@ export function validateCheckpoint(value: Checkpoint): Checkpoint {
       throw new AgentError("invalid_checkpoint", "Invalid checkpoint counters");
   if (typeof value.usage.known !== "boolean")
     throw new AgentError("invalid_checkpoint", "Invalid checkpoint usage");
+  if (
+    (value.modelIndex !== undefined &&
+      (!Number.isSafeInteger(value.modelIndex) || value.modelIndex < 0)) ||
+    (value.setupSignature !== undefined && typeof value.setupSignature !== "string") ||
+    (value.availableTools !== undefined &&
+      (!Array.isArray(value.availableTools) ||
+        value.availableTools.some((name) => typeof name !== "string")))
+  )
+    throw new AgentError("invalid_checkpoint", "Invalid V3 checkpoint metadata");
   resolveLimits(value.limits);
   const pending = new Map<string, unknown>();
   for (const message of value.state.messages) {

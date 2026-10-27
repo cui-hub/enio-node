@@ -23,6 +23,7 @@ export type {
   ExecuteBackend,
   ExecuteInput,
   ExecuteResult,
+  ExecuteChunk,
   ProcessBackendOptions,
 } from "./backends/process.js";
 export * from "./skills/skills.js";

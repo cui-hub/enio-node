@@ -1,3 +1,5 @@
+import type { ModelError } from "./errors.js";
+
 /** 核心协议与供应商无关。所有进入历史的内容都必须可序列化。 */
 export type JsonSchema = Record<string, unknown>;
 
@@ -73,8 +75,19 @@ export interface ToolContext<C = unknown> {
 /** execute 使用方法签名，允许不同参数类型的工具进入同一注册表。 */
 export interface Tool<A = unknown, C = unknown> extends ToolDefinition {
   effect: "read" | "write" | "execute";
+  /** 仅 read 工具可显式开启；作者承诺不修改共享业务状态及 ToolContext.state。 */
+  parallelSafe?: boolean;
+  /** 成功结果作为最终回答；同一模型批次最多一个，仍会完成批次内其他调用。 */
+  returnDirect?: boolean;
   execute(args: A, context: ToolContext<C>): Promise<ToolResult>;
+  /** 存在时 Runner 优先消费此流。须以唯一 result 片段结束；execute 保留兼容入口。 */
+  stream?(args: A, context: ToolContext<C>): AsyncIterable<ToolChunk>;
 }
+
+/** 进度是展示数据，不写入历史；最终 result 才经过外置/截断并回填模型。 */
+export type ToolChunk =
+  | { type: "text_delta"; text: string; channel?: "stdout" | "stderr" }
+  | { type: "result"; result: ToolResult };
 
 /** 未收到 usage 时不能把费用当作零；known=false 表示统计不完整。 */
 export interface Usage {
@@ -103,6 +116,70 @@ export interface ModelRequest {
 export interface ChatModel {
   generate(request: ModelRequest, signal: AbortSignal): Promise<ModelResponse>;
   stream?(request: ModelRequest, signal: AbortSignal): AsyncIterable<ModelChunk>;
+}
+
+/** 当前运行的生命周期信息；context 由宿主提供，resumed 区分新运行和检查点恢复。 */
+export interface MiddlewareContext<C> {
+  runId: string;
+  iteration: number;
+  context: Readonly<C>;
+  signal: AbortSignal;
+  resumed: boolean;
+}
+/** 每个模型尝试独立提供；modelIndex=0 为主模型，后续索引为备用模型，attempt 从 1 开始。 */
+export interface ModelCallContext<C> extends MiddlewareContext<C> {
+  modelIndex: number;
+  attempt: number;
+}
+
+/** beforeAgent 修改当前运行的装配，不能改变可复用 Agent 的原始配置。 */
+export interface AgentSetup<C> {
+  instructions: string;
+  tools: Tool<unknown, C>[];
+}
+
+/** next 在一次模型尝试中最多调用一次；需要重试交给 Runner 的统一预算。 */
+export type ModelEndpoint = (request: ModelRequest) => AsyncIterable<ModelChunk>;
+/** 工具参数已校验且权限已通过；next 不接受新参数，防止在鉴权后偷换调用。 */
+export type ToolEndpoint = () => AsyncIterable<ToolChunk>;
+
+/**
+ * 单 Agent 中间件。普通钩子按注册顺序执行，包装器按 A(B(endpoint)) 嵌套。
+ * 请求改写仅影响当前模型轮次；持久化历史压缩继续使用 ContextPolicy。
+ * 中间件是受信任的宿主代码，必须把 signal 传递给其自身启动的 I/O。
+ */
+export interface AgentMiddleware<C = unknown> {
+  name: string;
+  beforeAgent?(
+    setup: AgentSetup<C>,
+    context: MiddlewareContext<C>,
+  ): AgentSetup<C> | void | Promise<AgentSetup<C> | void>;
+  beforeModel?(
+    request: ModelRequest,
+    context: MiddlewareContext<C>,
+  ): ModelRequest | void | Promise<ModelRequest | void>;
+  afterModel?(
+    response: ModelResponse,
+    context: ModelCallContext<C>,
+  ): ModelResponse | void | Promise<ModelResponse | void>;
+  wrapModel?(
+    request: ModelRequest,
+    context: ModelCallContext<C>,
+    next: ModelEndpoint,
+  ): AsyncIterable<ModelChunk>;
+  wrapTool?(
+    call: Readonly<ToolCall>,
+    context: ToolContext<C>,
+    next: ToolEndpoint,
+  ): AsyncIterable<ToolChunk>;
+  afterAgent?(state: AgentSnapshot, context: MiddlewareContext<C>): void | Promise<void>;
+}
+
+/** 主模型重试耗尽后尝试备用模型；默认仅切换可重试 ModelError。 */
+export interface ModelFailover {
+  models: ChatModel[];
+  /** 仅针对 ModelError 调用；取消、协议错误和已输出文本的流不可通过此策略重放。 */
+  shouldFailover?(error: ModelError): boolean;
 }
 
 /** 宿主显式传入历史，框架不维护隐藏的全局会话。 */
@@ -148,6 +225,12 @@ export interface Checkpoint {
   projectInstructions: string;
   limits: Limits;
   info: JsonValue;
+  /** V3 可选扩展；旧检查点按主模型索引 0 恢复。 */
+  modelIndex?: number;
+  /** 校验 beforeAgent 动态装配在恢复时仍一致，不序列化工具函数。 */
+  setupSignature?: string;
+  /** 保存发生中断的模型轮次可见工具集合；恢复时仍不能调用被隐藏的工具。 */
+  availableTools?: string[];
 }
 
 /**
@@ -198,6 +281,8 @@ export interface Limits {
   maxToolResultBytes: number;
   maxInputBytes: number;
   maxModelResponseBytes: number;
+  /** 单次工具调用可对外输出的进度文本总字节数，与最终结果预算独立。 */
+  maxToolStreamBytes: number;
 }
 
 /** 终止错误不包含原始凭证、参数、堆栈或供应商响应体。 */
@@ -230,12 +315,14 @@ export interface RunResult {
 /** 事件判别联合允许业务在检查 type 后安全读取 payload。 */
 export interface EventPayloads {
   run_start: Record<string, never>;
-  model_start: { attempt: number };
+  model_start: { attempt: number; modelIndex?: number };
   text_delta: { text: string };
   tool_call_ready: { call: ToolCall };
   tool_start: { id: string; name: string };
   tool_end: { id: string; name: string; result: ToolResult };
-  model_retry: { attempt: number; delayMs: number };
+  tool_output: { id: string; name: string; text: string; channel?: "stdout" | "stderr" };
+  model_retry: { attempt: number; delayMs: number; modelIndex?: number };
+  model_fallback: { from: number; to: number; code: string };
   context_updated: { policy: string; beforeBytes: number; afterBytes: number };
   run_interrupted: RunInterrupt;
   run_resumed: { checkpointId: string };
@@ -287,6 +374,10 @@ export interface AgentsMdLoader {
 /** 可复用配置；具体 Skill 工具通过工厂显式注册，避免异步隐式初始化。 */
 export interface AgentConfig<C> {
   model: ChatModel;
+  modelFailover?: ModelFailover;
+  middlewares?: AgentMiddleware<C>[];
+  /** 默认 1；只并发连续且 parallelSafe=true 的只读调用，其他调用是顺序屏障。 */
+  toolExecution?: { maxConcurrency?: number };
   instructions?: string;
   /** 可选项目指令加载器；按 Eino 的方式作为临时 user 消息注入模型请求。 */
   agentsMd?: AgentsMdLoader;

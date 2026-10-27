@@ -1,5 +1,5 @@
 import type { ExecuteBackend, ExecuteInput } from "../backends/process.js";
-import type { Tool } from "../protocol/types.js";
+import type { Tool, ToolContext } from "../protocol/types.js";
 import { defineTool } from "../tools/registry.js";
 
 /** 默认不注册。只有宿主创建 backend 并把此工具放进 tools 才会开放执行能力。 */
@@ -25,5 +25,19 @@ export function createExecuteTool<C = unknown>({
     async execute(input, ctx) {
       return { ok: true, content: JSON.stringify(await backend.execute(input, ctx.signal)) };
     },
+    ...(backend.stream
+      ? {
+          async *stream(input: ExecuteInput, ctx: ToolContext<C>) {
+            for await (const chunk of backend.stream!(input, ctx.signal)) {
+              if (chunk.type === "text_delta") yield chunk;
+              else
+                yield {
+                  type: "result" as const,
+                  result: { ok: true as const, content: JSON.stringify(chunk.result) },
+                };
+            }
+          },
+        }
+      : {}),
   });
 }
