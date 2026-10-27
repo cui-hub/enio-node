@@ -29,6 +29,7 @@
     "demo": "tsx examples/file-report.ts",
     "demo:business": "tsx examples/business-tool.ts",
     "demo:instructions": "tsx examples/project-instructions.ts",
+    "demo:context": "tsx examples/context-resume.ts",
     "demo:live": "tsx examples/file-report.ts --live",
     "check": "pnpm run format:check && pnpm run typecheck && pnpm run test && pnpm run build"
   },

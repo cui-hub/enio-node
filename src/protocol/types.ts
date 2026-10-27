@@ -16,8 +16,29 @@ export type Message =
 
 /** Tool 只返回文本；业务 JSON 应先序列化成 content，外层信封保持有效。 */
 export type ToolResult =
-  | { ok: true; content: string; truncated?: boolean }
-  | { ok: false; code: string; message: string; retryableByModel: boolean; truncated?: boolean };
+  | { ok: true; content: string; truncated?: boolean; artifact?: ArtifactReference }
+  | {
+      ok: false;
+      code: string;
+      message: string;
+      retryableByModel: boolean;
+      truncated?: boolean;
+      artifact?: ArtifactReference;
+    };
+
+/** 只允许 JSON 数据进入检查点；身份、客户端、函数和 AbortSignal 留在宿主。 */
+export type JsonValue =
+  null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/** 完整工具结果的不可变外置引用；id 不是宿主文件路径。 */
+export interface ArtifactReference {
+  id: string;
+  bytes: number;
+}
+export interface ArtifactStore {
+  write(content: string, signal: AbortSignal): Promise<ArtifactReference>;
+  read(id: string, signal: AbortSignal): Promise<string>;
+}
 
 /** 对模型可见的工具元数据，不包含执行函数、权限对象或服务客户端。 */
 export interface ToolDefinition {
@@ -26,7 +47,7 @@ export interface ToolDefinition {
   inputSchema: JsonSchema;
 }
 
-/** 运行内待办，不是持久化任务、工作流或跨 Agent 调度。 */
+/** 运行内待办，可随快照/检查点保存；不承担工作流或跨 Agent 调度。 */
 export interface Todo {
   id: string;
   content: string;
@@ -45,6 +66,8 @@ export interface ToolContext<C = unknown> {
   signal: AbortSignal;
   context: Readonly<C>;
   state: RunState;
+  /** 仅中断所在调用收到恢复数据。恢复仍经过权限检查与 beforeTool。 */
+  resume?: { data: JsonValue };
 }
 
 /** execute 使用方法签名，允许不同参数类型的工具进入同一注册表。 */
@@ -86,6 +109,79 @@ export interface ChatModel {
 export interface RunInput {
   input: string;
   messages?: Message[];
+  /** 上一轮成功结束的工作上下文；与 messages 互斥，包含压缩历史和 todos。 */
+  state?: AgentSnapshot;
+}
+
+/** 可持久化的对话状态，不包含临时系统指令和业务 context。 */
+export interface AgentSnapshot {
+  schemaVersion: 1;
+  messages: Message[];
+  todos: Todo[];
+  /** 摘要删除历史后仍保留调用编号，避免同一对话重复使用旧 id。 */
+  usedToolCallIds: string[];
+}
+
+/** beforeTool 返回此对象时在实际执行前暂停；不能把取消当作可恢复中断。 */
+export interface InterruptRequest {
+  type: "interrupt";
+  info: JsonValue;
+}
+export interface RunInterrupt {
+  checkpointId: string;
+  call: ToolCall;
+  info: JsonValue;
+}
+
+/** 检查点恢复同一次运行；messages 允许尾部带尚未执行的工具调用。 */
+export interface Checkpoint {
+  schemaVersion: 1;
+  id: string;
+  binding: string;
+  runId: string;
+  seq: number;
+  iteration: number;
+  toolCalls: number;
+  usage: Usage & { known: boolean };
+  state: AgentSnapshot;
+  pendingCalls: ToolCall[];
+  projectInstructions: string;
+  limits: Limits;
+  info: JsonValue;
+}
+
+/**
+ * take 必须原子消费且先校验 binding；同一检查点只可恢复一次。
+ * 不自动重放崩溃后已领取的检查点，以免重复外部副作用。
+ */
+export interface CheckpointStore {
+  save(checkpoint: Checkpoint, signal: AbortSignal): Promise<void>;
+  take(id: string, binding: string, signal: AbortSignal): Promise<Checkpoint>;
+}
+
+/** 策略获得隔离快照；request 包含临时指令，用于计算实际输入预算。 */
+export interface ContextPolicyInput {
+  runId: string;
+  messages: Message[];
+  request: ModelRequest;
+  signal: AbortSignal;
+}
+export interface ContextUpdate {
+  messages: Message[];
+  usage?: Usage;
+  usageKnown?: boolean;
+}
+export interface ContextPolicy {
+  name: string;
+  beforeModel?(input: ContextPolicyInput): Promise<ContextUpdate | undefined>;
+  afterTool?(input: {
+    runId: string;
+    call: ToolCall;
+    result: ToolResult;
+    signal: AbortSignal;
+    /** 运行时硬上限，外置策略应在触及此上限之前保存完整结果。 */
+    maxResultBytes?: number;
+  }): Promise<ToolResult>;
 }
 
 /** 各预算独立计数：模型重试不增加 iteration，工具尝试（包括参数错误）计数。 */
@@ -114,7 +210,7 @@ export interface RunError {
 /** historyComplete=false 的历史仅供诊断，不可直接作为下一轮模型输入。 */
 export interface RunResult {
   runId: string;
-  status: "completed" | "failed" | "cancelled";
+  status: "completed" | "failed" | "cancelled" | "interrupted";
   stopReason: string;
   finalText: string;
   messages: Message[];
@@ -126,6 +222,9 @@ export interface RunResult {
   usage: Usage & { known: boolean };
   observerErrors: number;
   error?: RunError;
+  /** 仅成功结束提供完整可复用状态；中断通过 checkpointId 恢复。 */
+  state?: AgentSnapshot;
+  interrupt?: RunInterrupt;
 }
 
 /** 事件判别联合允许业务在检查 type 后安全读取 payload。 */
@@ -137,6 +236,9 @@ export interface EventPayloads {
   tool_start: { id: string; name: string };
   tool_end: { id: string; name: string; result: ToolResult };
   model_retry: { attempt: number; delayMs: number };
+  context_updated: { policy: string; beforeBytes: number; afterBytes: number };
+  run_interrupted: RunInterrupt;
+  run_resumed: { checkpointId: string };
   run_end: { result: RunResult };
 }
 
@@ -164,7 +266,12 @@ export interface Hooks<C> {
   beforeTool?(
     call: Readonly<ToolCall>,
     context: ToolContext<C>,
-  ): Promise<boolean | void> | boolean | void;
+  ): Promise<boolean | void | InterruptRequest> | boolean | void | InterruptRequest;
+  /** 成功结束时等待宿主保存工作上下文；失败/取消/中断不调用。 */
+  afterAgent?(
+    state: AgentSnapshot,
+    context: { runId: string; context: Readonly<C>; signal: AbortSignal },
+  ): void | Promise<void>;
   /** 观察回调只接受事件快照；异常被隔离，不影响业务结果。 */
   onEvent?(event: AgentEvent): void | Promise<void>;
 }
@@ -184,6 +291,9 @@ export interface AgentConfig<C> {
   /** 可选项目指令加载器；按 Eino 的方式作为临时 user 消息注入模型请求。 */
   agentsMd?: AgentsMdLoader;
   tools?: Tool<unknown, C>[];
+  /** 按数组顺序执行，通常先 reduction 再 summarization。 */
+  contextPolicies?: ContextPolicy[];
+  checkpoints?: { store: CheckpointStore; namespace: string };
   limits?: Partial<Limits>;
   hooks?: Hooks<C>;
   /** 默认允许已注册工具；提供此回调可实施业务 ACL。false 变成工具错误。 */
@@ -198,10 +308,19 @@ export interface RunOptions<C> {
   context: C;
   signal?: AbortSignal;
   limits?: Partial<Limits>;
+  /** 启用检查点时必传；由宿主根据登录身份/会话生成，不接受模型指定。 */
+  checkpointOwner?: string;
+}
+
+export interface ResumeInput {
+  checkpointId: string;
+  data: JsonValue;
 }
 
 /** stream 是惰性迭代器；return() 会立即发出取消信号，再清理引擎。 */
 export interface Agent<C> {
   run(input: RunInput, options: RunOptions<C>): Promise<RunResult>;
   stream(input: RunInput, options: RunOptions<C>): AsyncIterableIterator<AgentEvent>;
+  resume(input: ResumeInput, options: RunOptions<C>): Promise<RunResult>;
+  resumeStream(input: ResumeInput, options: RunOptions<C>): AsyncIterableIterator<AgentEvent>;
 }

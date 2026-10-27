@@ -4,7 +4,7 @@
 
 项目仓库：[cui-hub/enio-node](https://github.com/cui-hub/enio-node)。建议结合源码注释、架构文档和离线示例理解模型调用、工具执行与运行时控制的完整链路。
 
-一期已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、inline Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。子 Agent、Graph、Workflow、检查点恢复和审批留到后续阶段。
+已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、inline Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。本阶段增加历史摘要、工具结果外置、工作状态导出和工具执行前的持久化中断恢复。子 Agent、Graph、Workflow 与业务审批系统留到后续阶段。
 
 ## 快速运行
 
@@ -29,17 +29,18 @@ nvm use "$task_node_before"
 
 离线文件演示无需 API Key。它创建临时工作区，复制三份资料，实际执行 `skill → write_todos → glob → read_file → write_file → read_file → write_todos`，并打印报告路径。演示保留临时目录供查看；自动测试在结束后清理自己的目录。
 
-| 命令                     | 用途                                   |
-| ------------------------ | -------------------------------------- |
-| `pnpm run typecheck`     | 检查 SDK、测试和示例的 TypeScript 类型 |
-| `pnpm run format:check`  | 只读检查源码、测试与文档格式           |
-| `pnpm run test`          | 离线行为测试，默认跳过真实模型测试     |
-| `pnpm run build`         | 生成 ESM、类型声明、source map 到 dist |
-| `pnpm run check`         | 格式检查＋类型检查＋离线测试＋构建     |
-| `pnpm run demo`          | 使用脚本模型完成真实文件任务           |
-| `pnpm run demo:business` | 展示业务工具与宿主身份上下文           |
-| `pnpm run demo:live`     | 使用宿主配置的真实模型完成文件任务     |
-| `pnpm run test:live`     | 显式执行会产生模型费用的集成验收       |
+| 命令                     | 用途                                     |
+| ------------------------ | ---------------------------------------- |
+| `pnpm run typecheck`     | 检查 SDK、测试和示例的 TypeScript 类型   |
+| `pnpm run format:check`  | 只读检查源码、测试与文档格式             |
+| `pnpm run test`          | 离线行为测试，默认跳过真实模型测试       |
+| `pnpm run build`         | 生成 ESM、类型声明、source map 到 dist   |
+| `pnpm run check`         | 格式检查＋类型检查＋离线测试＋构建       |
+| `pnpm run demo`          | 使用脚本模型完成真实文件任务             |
+| `pnpm run demo:business` | 展示业务工具与宿主身份上下文             |
+| `pnpm run demo:context`  | 演示摘要、结果外置、确认中断与新实例恢复 |
+| `pnpm run demo:live`     | 使用宿主配置的真实模型完成文件任务       |
+| `pnpm run test:live`     | 显式执行会产生模型费用的集成验收         |
 
 ## 最小接入
 
@@ -114,13 +115,13 @@ const model = createOpenAICompatibleModel({
 
 ## Tool 与 Skill
 
-| 能力     | 接入方式                                            | 执行行为                               |
-| -------- | --------------------------------------------------- | -------------------------------------- |
-| 业务工具 | `defineTool` 后加入 `tools`                         | 校验参数和权限，再调用业务函数         |
-| 文件工具 | `createFileTools({ backend })`                      | 同一执行器调用内存或本地 backend       |
-| 待办     | `createTodoTool()`                                  | 替换当前 run 的 todos，不持久化        |
-| Skill    | `await createSkillTool({ backend })` 后加入 `tools` | 元数据预加载，正文按需回填当前 Agent   |
-| 命令执行 | `createExecuteTool({ backend })`                    | 只有显式注册才开放；默认文件示例不注册 |
+| 能力     | 接入方式                                            | 执行行为                                   |
+| -------- | --------------------------------------------------- | ------------------------------------------ |
+| 业务工具 | `defineTool` 后加入 `tools`                         | 校验参数和权限，再调用业务函数             |
+| 文件工具 | `createFileTools({ backend })`                      | 同一执行器调用内存或本地 backend           |
+| 待办     | `createTodoTool()`                                  | 替换当前 run 的 todos，可随快照/检查点保存 |
+| Skill    | `await createSkillTool({ backend })` 后加入 `tools` | 元数据预加载，正文按需回填当前 Agent       |
+| 命令执行 | `createExecuteTool({ backend })`                    | 只有显式注册才开放；默认文件示例不注册     |
 
 ```typescript
 const backend = createLocalFilesystem({
@@ -192,6 +193,14 @@ AGENTS.md 中可引用其他文件，例如：
 
 完整可运行示例：[examples/project-instructions.ts](examples/project-instructions.ts)，执行 `pnpm run demo:instructions`；示例使用真实临时文件和确定性模型，不需要 API Key，并在结束时清理目录。
 
+## 长上下文与中断恢复
+
+通过 `contextPolicies` 显式配置 `createToolResultReduction` 和 `createSummarization`；结果外置使用 ArtifactStore，读取能力通过 `createArtifactTool` 加入 `tools`。摘要在主模型调用前执行，生成后的工作上下文可通过 `exportState`、`serializeState` 保存，并通过 `RunInput.state` 传入下一轮。
+
+配置 `checkpoints: { store, namespace }` 后，可在 `hooks.beforeTool` 返回 `interrupt(info)`，在工具执行前暂停。宿主取得确认后调用 `resume` / `resumeStream`；已经回填结果的工具不会再次执行。每次运行要求宿主提供 `checkpointOwner`，恢复仍执行权限检查。
+
+内置存储有内存和本地文件两种实现。检查点采用一次领取语义，不自动重放取消、崩溃或未知副作用；业务写操作仍需要幂等控制。完整接入代码、默认值和恢复边界见 [长上下文与恢复指南](docs/context-and-resume.md)。离线示例：[examples/context-resume.ts](examples/context-resume.ts)，运行 `pnpm run demo:context`。
+
 ## 流式事件与运行结果
 
 ```typescript
@@ -213,7 +222,7 @@ for await (const event of agent.stream(
 
 完整消费时返回唯一 `run_end`。中间文本不代表完成，最终以 `RunResult.status` 为准。主动 break／return 会立即发出取消信号并清理迭代器，关闭后的消费者不会再收到终止事件。采用拉取式背压，没有额外的无界事件队列。
 
-业务配置错误在创建时抛出；运行错误以 `failed`／`cancelled` 结果返回。未知工具、无效参数和显式 `ToolError` 会回填模型，未分类异常终止运行。取消途中未完成的工具调用保留在 `pendingToolCallIds`；`historyComplete=false` 的消息仅供诊断，不能直接重用。完整历史可由宿主保存后传入 `RunInput.messages`，这不等于持久化恢复。
+业务配置错误在创建时抛出；运行错误以 `failed`／`cancelled` 结果返回。未知工具、无效参数和显式 `ToolError` 会回填模型，未分类异常终止运行。未完成的工具调用保留在 `pendingToolCallIds`；`historyComplete=false` 的消息不能直接作为新一轮历史。`interrupted` 结果提供检查点 ID，用于恢复待执行批次。成功结果可导出 `state`；仅传入完整 `messages` 是继续对话，不是执行恢复。
 
 ## 关键限制
 
@@ -234,7 +243,8 @@ for await (const event of agent.stream(
 ## 源码阅读
 
 - [架构与扩展方式](docs/architecture.md)：模块依赖、循环和取消链路。
-- [验收记录](docs/acceptance.md)：一期 A01–A15 对应测试与未验证部分。
+- [长上下文与恢复指南](docs/context-and-resume.md)：摘要、外置、快照、中断与存储契约。
+- [验收记录](docs/acceptance.md)：各阶段对应测试与未验证部分。
 - [Eino 源码](https://github.com/cloudwego/eino)：参考框架，可对照理解 Go 与 TypeScript 的实现方式。
 
 核心代码配有中文 JSDoc，说明公开类型、执行阶段、权限边界和失败语义。构建产物由 tsc 生成，不手改 `dist/`。

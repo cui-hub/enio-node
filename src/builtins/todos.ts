@@ -2,7 +2,7 @@ import { ToolError } from "../protocol/errors.js";
 import type { Todo, Tool } from "../protocol/types.js";
 import { defineTool } from "../tools/registry.js";
 
-/** 整表替换便于模型维护小型计划；数据写入当前 run 的 state，不跨会话共享。 */
+/** 整表替换便于模型维护小型计划；写入当前 run 状态，可随显式快照或检查点延续。 */
 export function createTodoTool<C = unknown>(): Tool<{ todos: Todo[] }, C> {
   return defineTool({
     name: "write_todos",

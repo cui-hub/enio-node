@@ -1,4 +1,4 @@
-# 一期架构与扩展说明
+# 架构与扩展说明
 
 ## 模块依赖
 
@@ -9,6 +9,9 @@ flowchart TD
   Runtime --> Registry[ToolRegistry / ToolExecutor]
   Runtime --> Model[ChatModel 接口]
   Runtime --> Instructions[AgentsMdLoader 接口]
+  Runtime --> Policies[ContextPolicy / 摘要与清理]
+  Runtime --> Checkpoints[CheckpointStore / 原子领取]
+  Policies --> Artifacts[ArtifactStore / 完整结果外置]
   AgentsMd[createAgentsMd / 引用与预算] -.实现.-> Instructions
   AgentsMd --> InstructionBackend[AgentsMdBackend read]
   InstructionBackend --> Local
@@ -43,10 +46,15 @@ flowchart TD
 | src/instructions/agents-md.ts      | 项目指令来源协议、引用展开、去重、告警与字节预算   |
 | src/backends/local-agents-md.ts    | 把 LocalFileStore 接入项目指令加载器               |
 | src/backends/process.ts            | 显式授权、shell=false、有界输出和进程组清理        |
+| src/context/                       | 模型调用前摘要/清理，工具结果外置                  |
+| src/runtime/state.ts               | 快照导出、JSON 校验、检查点尾部工具配对校验        |
+| src/runtime/interrupt.ts           | 工具执行前的中断请求                               |
+| src/backends/context-stores.ts     | 内存/文件 ArtifactStore 与一次领取检查点           |
+| src/builtins/artifacts.ts          | 外置内容 UTF-8 字节分页读取                        |
 
 ## 循环及不变量
 
-每轮先检查预算，再生成请求快照，随后聚合完整模型响应。只有 finishReason 正常、工具批次结构合法且总预算充足，才追加 assistant 消息并执行工具。每个调用经过“注册查找→JSON 解析→Schema 校验→宿主权限→beforeTool→execute→结果规范化”，结果通过 toolCallId 追加回历史。
+每轮先完成已有工具批次，再检查下一次模型调用预算，执行上下文策略并生成请求快照，随后聚合完整模型响应。只有 finishReason 正常、工具批次结构合法且总预算充足，才追加 assistant 消息并执行工具。每个调用经过“注册查找→JSON 解析→Schema 校验→宿主权限→beforeTool→execute→结果外置策略→硬性限量”，结果通过 toolCallId 追加回历史。beforeTool 可以返回中断请求，保存状态后结束当前事件流。
 
 整个批次在开始副作用前检查编号重复、数量上限和参数体积。单个调用参数错误允许回填并继续，取消或致命错误停止余下调用，保留未完成编号。没有工具的正常模型回复才生成 completed；一期没有 returnDirectly。
 
@@ -107,8 +115,16 @@ Schema 的类型不会自动推导到泛型 A；作者须保持二者一致，�
 | 文件原子写入            | 新文件排他创建；覆盖临时文件＋rename   | 不承诺文件创建失败时回滚或多文件事务                  |
 | 正式发布与真实模型验收  | private 包；真实测试显式启用           | 当前先交付本地代码；尚无模型端点和凭证                |
 
+## 长上下文与恢复
+
+`contextPolicies` 是本阶段的专用扩展接口，没有移植 Eino 的全套 Middleware。beforeModel 按顺序接收隔离快照，可以返回新的完整工作历史；runtime 校验工具配对，并保留压缩前的调用 ID。afterTool 在硬截断之前拿到完整工具结果。策略不能直接修改运行中的历史数组。
+
+成功结束时提供 `AgentSnapshot` 和可等待的 `afterAgent` 钩子，用于宿主持久化。中断则存储含未完成尾部批次的 Checkpoint，通过 resume 优先执行待完成调用。存储的 take 必须原子校验并消费，恢复重新校验权限；context、模型实例和工具实现由宿主重新提供。
+
+具体默认值、状态区分、流程图与恢复限制见 [长上下文与恢复指南](context-and-resume.md)。
+
 ## 后续阶段
 
-二期需要版本化的持久状态、工具边界恢复、审批、业务幂等键和隔离 backend。三期再按需求补上下文压缩、长结果外置、MCP 和动态工具发现。子 Agent／Workflow／Graph 应独立设计执行与恢复语义，不把当前循环改成隐藏编排器。
+本阶段已覆盖版本化状态、工具执行前的中断恢复、摘要与长结果外置。业务审批界面、幂等与补偿、隔离 backend、MCP 和动态工具发现按需补充。子 Agent／Workflow／Graph 应独立设计执行与恢复语义，不把当前循环改成隐藏编排器。
 
 参考源码：Eino commit `58d184303f4e73413c454a9626f79c17af0fd9fb` 的 `adk/chatmodel.go`、`adk/react.go`、`compose/tool_node.go`、`components/tool/interface.go` 及 `adk/middlewares/`。当前代码为独立 TypeScript 实现，没有复制其 Go 图执行器。
