@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { AgentError, ToolError } from "../protocol/errors.js";
-import { checkAbort, truncateUtf8 } from "../runtime/control.js";
+import { abortable, checkAbort, truncateUtf8 } from "../runtime/control.js";
 import { relativePath } from "./filesystem.js";
 
 /** 结构化命令不会被 shell 再解释；是否允许 args 由宿主策略决定。 */
@@ -22,7 +22,13 @@ export interface ExecuteResult {
 /** 可替换为远端或容器执行器；该接口不意味着本地实现具备沙箱隔离。 */
 export interface ExecuteBackend {
   execute(input: ExecuteInput, signal: AbortSignal): Promise<ExecuteResult>;
+  /** 可选进度流；stdout/stderr 为展示文本，最终 result 才表示进程退出。 */
+  stream?(input: ExecuteInput, signal: AbortSignal): AsyncIterable<ExecuteChunk>;
 }
+/** 同一进程只执行一次；非流式调用收集同一执行器的最终结果。 */
+export type ExecuteChunk =
+  | { type: "text_delta"; text: string; channel: "stdout" | "stderr" }
+  | { type: "result"; result: ExecuteResult };
 /** 命令列表与 authorize 必须同时通过，环境变量只有显式传入的键可见。 */
 export interface ProcessBackendOptions {
   root: string;
@@ -51,109 +57,161 @@ export function createProcessBackend(options: ProcessBackendOptions): ExecuteBac
     throw new AgentError("invalid_config", "Invalid process budget");
   const commands = new Set(options.commands);
   const env = { ...options.env };
-  return {
-    async execute(input, signal) {
-      checkAbort(signal);
-      const request = structuredClone(input);
-      if (!commands.has(request.command) || !(await options.authorize(structuredClone(request))))
-        throw new ToolError("permission_denied", "Command denied by host policy", false);
-      const root = await realpath(options.root);
-      const relative = relativePath(request.cwd ?? ".", true);
-      let cwd = root;
-      for (const part of relative === "." ? [] : relative.split("/")) {
-        cwd = path.join(cwd, part);
-        const stat = await lstat(cwd);
-        if (!stat.isDirectory() || stat.isSymbolicLink())
-          throw new ToolError("invalid_path", "Command cwd must be a real directory");
-      }
-      checkAbort(signal);
-      return new Promise<ExecuteResult>((resolve, reject) => {
-        const child = spawn(request.command, request.args ?? [], {
-          cwd,
-          env,
-          shell: false,
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
+  const run = async (
+    input: ExecuteInput,
+    signal: AbortSignal,
+    onOutput?: (text: string, channel: "stdout" | "stderr") => void,
+  ): Promise<ExecuteResult> => {
+    checkAbort(signal);
+    const request = structuredClone(input);
+    if (!commands.has(request.command) || !(await options.authorize(structuredClone(request))))
+      throw new ToolError("permission_denied", "Command denied by host policy", false);
+    const root = await realpath(options.root);
+    const relative = relativePath(request.cwd ?? ".", true);
+    let cwd = root;
+    for (const part of relative === "." ? [] : relative.split("/")) {
+      cwd = path.join(cwd, part);
+      const stat = await lstat(cwd);
+      if (!stat.isDirectory() || stat.isSymbolicLink())
+        throw new ToolError("invalid_path", "Command cwd must be a real directory");
+    }
+    checkAbort(signal);
+    return new Promise<ExecuteResult>((resolve, reject) => {
+      const child = spawn(request.command, request.args ?? [], {
+        cwd,
+        env,
+        shell: false,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = Buffer.alloc(0);
+      let stderr = Buffer.alloc(0);
+      let bytes = 0;
+      let truncated = false;
+      let stopped: AgentError | undefined;
+      let forceTimer: ReturnType<typeof setTimeout> | undefined;
+      let forceDone = Promise.resolve();
+      // 两个通道分别增量解码，跨 data 事件的多字节字符不能被拆坏。
+      const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
+      // 杀整个进程组，防止只结束父进程而留下普通子进程。脱离进程组者不受保证。
+      const kill = (kind: NodeJS.Signals) => {
+        if (!child.pid) return;
+        try {
+          process.kill(-child.pid, kind);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(kind);
+        }
+      };
+      const stop = (error: AgentError) => {
+        if (stopped) return;
+        stopped = error;
+        kill("SIGTERM");
+        forceDone = new Promise<void>((done) => {
+          forceTimer = setTimeout(() => {
+            kill("SIGKILL");
+            done();
+          }, grace);
         });
-        let stdout = Buffer.alloc(0);
-        let stderr = Buffer.alloc(0);
-        let bytes = 0;
-        let truncated = false;
-        let stopped: AgentError | undefined;
-        let forceTimer: ReturnType<typeof setTimeout> | undefined;
-        let forceDone = Promise.resolve();
-        // 杀整个进程组，防止只结束父进程而留下普通子进程。脱离进程组者不受保证。
-        const kill = (kind: NodeJS.Signals) => {
-          if (!child.pid) return;
-          try {
-            process.kill(-child.pid, kind);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(kind);
-          }
-        };
-        const stop = (error: AgentError) => {
-          if (stopped) return;
-          stopped = error;
-          kill("SIGTERM");
-          forceDone = new Promise<void>((done) => {
-            forceTimer = setTimeout(() => {
-              kill("SIGKILL");
-              done();
-            }, grace);
-          });
-        };
-        const abort = () =>
-          stop(
-            new AgentError("cancelled", "Command cancelled; side effects may have occurred", true),
-          );
-        const timer = setTimeout(
-          () =>
-            stop(
-              new AgentError(
-                "tool_timeout",
-                "Command timed out; side effects may have occurred",
-                true,
-              ),
-            ),
-          timeout,
+      };
+      const abort = () =>
+        stop(
+          new AgentError("cancelled", "Command cancelled; side effects may have occurred", true),
         );
-        signal.addEventListener("abort", abort, { once: true });
-        if (signal.aborted) abort();
-        const collect = (chunk: Buffer, channel: "stdout" | "stderr") => {
-          const remaining = Math.max(0, maximum - bytes);
-          const part = chunk.subarray(0, remaining);
-          bytes += part.length;
-          truncated ||= part.length < chunk.length;
-          if (channel === "stdout") stdout = Buffer.concat([stdout, part]);
-          else stderr = Buffer.concat([stderr, part]);
-        };
-        child.stdout.on("data", (chunk) => collect(Buffer.from(chunk), "stdout"));
-        child.stderr.on("data", (chunk) => collect(Buffer.from(chunk), "stderr"));
-        const cleanup = () => {
-          clearTimeout(timer);
-          signal.removeEventListener("abort", abort);
-        };
-        child.once("error", () => {
-          cleanup();
-          clearTimeout(forceTimer);
-          reject(new ToolError("execute_failed", "Could not start command", false));
-        });
-        child.once("close", (exitCode, exitSignal) => {
-          cleanup();
-          void forceDone.then(() => {
-            if (stopped) reject(stopped);
-            else {
-              // stream=true 丢弃预算边缘的不完整 UTF-8 尾部，避免生成半个汉字。
-              const out = truncateUtf8(new TextDecoder().decode(stdout, { stream: true }), maximum);
-              const err = truncateUtf8(
-                new TextDecoder().decode(stderr, { stream: true }),
-                maximum - Buffer.byteLength(out),
-              );
-              resolve({ exitCode, signal: exitSignal, stdout: out, stderr: err, truncated });
-            }
-          });
+      const timer = setTimeout(
+        () =>
+          stop(
+            new AgentError(
+              "tool_timeout",
+              "Command timed out; side effects may have occurred",
+              true,
+            ),
+          ),
+        timeout,
+      );
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      const collect = (chunk: Buffer, channel: "stdout" | "stderr") => {
+        const remaining = Math.max(0, maximum - bytes);
+        const part = chunk.subarray(0, remaining);
+        bytes += part.length;
+        truncated ||= part.length < chunk.length;
+        if (channel === "stdout") stdout = Buffer.concat([stdout, part]);
+        else stderr = Buffer.concat([stderr, part]);
+        const text = decoders[channel].decode(part, { stream: true });
+        if (text) onOutput?.(text, channel);
+      };
+      child.stdout.on("data", (chunk) => collect(Buffer.from(chunk), "stdout"));
+      child.stderr.on("data", (chunk) => collect(Buffer.from(chunk), "stderr"));
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+      };
+      child.once("error", () => {
+        cleanup();
+        clearTimeout(forceTimer);
+        reject(new ToolError("execute_failed", "Could not start command", false));
+      });
+      child.once("close", (exitCode, exitSignal) => {
+        cleanup();
+        void forceDone.then(() => {
+          if (stopped) reject(stopped);
+          else {
+            // stream=true 丢弃预算边缘的不完整 UTF-8 尾部，避免生成半个汉字。
+            const out = truncateUtf8(new TextDecoder().decode(stdout, { stream: true }), maximum);
+            const err = truncateUtf8(
+              new TextDecoder().decode(stderr, { stream: true }),
+              maximum - Buffer.byteLength(out),
+            );
+            resolve({ exitCode, signal: exitSignal, stdout: out, stderr: err, truncated });
+          }
         });
       });
+    });
+  };
+  return {
+    execute: run,
+    async *stream(input, signal) {
+      const controller = new AbortController();
+      const combined = AbortSignal.any([signal, controller.signal]);
+      // 只缓存被输出预算接纳的非空片段：内存上限随 maxOutputBytes 有界，不缓存被丢弃的日志。
+      const queue: ExecuteChunk[] = [];
+      let wake: (() => void) | undefined;
+      let done = false;
+      let failure: unknown;
+      const work = run(input, combined, (text, channel) => {
+        queue.push({ type: "text_delta", text, channel });
+        wake?.();
+      })
+        .then(
+          (result) => {
+            queue.push({ type: "result", result });
+          },
+          (error: unknown) => {
+            failure = error;
+          },
+        )
+        .finally(() => {
+          done = true;
+          wake?.();
+        });
+      try {
+        while (!done || queue.length) {
+          checkAbort(combined);
+          if (queue.length) yield queue.shift()!;
+          else
+            await abortable(
+              new Promise<void>((resolve) => {
+                wake = resolve;
+              }),
+              combined,
+            );
+        }
+        if (failure) throw failure;
+      } finally {
+        controller.abort();
+        // 第一个进度出现后进程已启动，取消会清理进程组及计时器。
+        await work;
+      }
     },
   };
 }

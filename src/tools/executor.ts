@@ -1,5 +1,13 @@
 import { AgentError, ToolError, toAgentError } from "../protocol/errors.js";
-import type { AgentConfig, Limits, ToolCall, ToolContext, ToolResult } from "../protocol/types.js";
+import type {
+  AgentConfig,
+  Limits,
+  ToolCall,
+  ToolContext,
+  ToolResult,
+  ToolChunk,
+  ToolEndpoint,
+} from "../protocol/types.js";
 import {
   abortable,
   byteLength,
@@ -63,21 +71,30 @@ export function normalizeToolResult(value: ToolResult, maximum: number): ToolRes
 }
 
 /** 内置和业务工具共用此执行器，权限、hook、超时都在同一条链路上。 */
-export async function executeTool<C>(
+export async function* streamTool<C>(
   registry: ToolRegistry<C>,
   call: ToolCall,
   context: ToolContext<C>,
   config: AgentConfig<C>,
   limits: Limits,
-): Promise<ToolResult> {
+  availableTools?: ReadonlySet<string>,
+): AsyncGenerator<ToolChunk> {
   const scope = createScope(context.signal, limits.toolTimeoutMs, "tool_timeout");
   const ctx = { ...context, signal: scope.signal };
   let sideEffectStarted = false;
   let executionStarted = false;
   let toolFinished = false;
+  let iterator: AsyncIterator<ToolChunk> | undefined;
+  let streamFinished = false;
   try {
     checkAbort(scope.signal);
     const { tool, args } = registry.prepare(call.name, call.arguments);
+    if (availableTools && !availableTools.has(call.name))
+      throw new ToolError(
+        "tool_not_available",
+        "Tool is not available in this model request",
+        false,
+      );
     if (config.allowTool) {
       const allowed = await abortable(
         Promise.resolve().then(() =>
@@ -110,19 +127,69 @@ export async function executeTool<C>(
       }
     }
     checkAbort(scope.signal);
-    sideEffectStarted = tool.effect !== "read";
     executionStarted = true;
-    const result = await abortable(
-      Promise.resolve().then(() => {
-        checkAbort(scope.signal);
-        return tool.execute(args, ctx);
-      }),
-      scope.signal,
-    );
+    // 包装器位于权限检查之后；next 无参数且只可调用一次，不能绕过校验或重复写入。
+    let endpoint: ToolEndpoint = async function* () {
+      checkAbort(scope.signal);
+      sideEffectStarted = tool.effect !== "read";
+      if (tool.stream) {
+        for await (const chunk of tool.stream(args, ctx)) {
+          // 业务已交付结果后包装器再报错，不得伪装成可重试的业务失败。
+          if (chunk?.type === "result") toolFinished = true;
+          yield chunk;
+        }
+      } else {
+        const result = await tool.execute(args, ctx);
+        toolFinished = true;
+        yield { type: "result", result };
+      }
+    };
+    for (const middleware of [...(config.middlewares ?? [])].reverse()) {
+      if (!middleware.wrapTool) continue;
+      const inner = endpoint;
+      let invoked = false;
+      endpoint = () =>
+        middleware.wrapTool!(Object.freeze({ ...call }), ctx, () => {
+          checkAbort(scope.signal);
+          if (invoked)
+            throw new AgentError("invalid_middleware", "Tool next may only be called once");
+          invoked = true;
+          return inner();
+        });
+    }
+    iterator = endpoint()[Symbol.asyncIterator]();
+    let raw: ToolResult | undefined;
+    let outputBytes = 0;
+    while (true) {
+      const next = await abortable(
+        Promise.resolve().then(() => iterator!.next()),
+        scope.signal,
+      );
+      if (next.done) {
+        streamFinished = true;
+        break;
+      }
+      if (raw)
+        throw new AgentError("invalid_tool_stream", "Tool emitted chunks after its final result");
+      const chunk = next.value;
+      if (
+        chunk?.type === "text_delta" &&
+        typeof chunk.text === "string" &&
+        (chunk.channel === undefined || chunk.channel === "stdout" || chunk.channel === "stderr")
+      ) {
+        outputBytes += byteLength(chunk.text);
+        if (outputBytes > limits.maxToolStreamBytes)
+          throw new AgentError("limit_exceeded", "Tool stream exceeds progress budget");
+        if (chunk.text) yield structuredClone(chunk);
+      } else if (chunk?.type === "result")
+        raw = normalizeToolResult(chunk.result, Number.MAX_SAFE_INTEGER);
+      else throw new AgentError("invalid_tool_stream", "Invalid tool stream chunk");
+    }
+    if (!raw) throw new AgentError("invalid_tool_stream", "Tool stream ended without a result");
     checkAbort(scope.signal);
     toolFinished = true;
-    // 先验证结果形状，再让外置策略读取完整文本，最后应用硬性输出上限。
-    let transformed = normalizeToolResult(result, Number.MAX_SAFE_INTEGER);
+    // 外置策略拿到完整最终结果，展示用进度永远不进入工作历史或检查点。
+    let transformed = raw;
     for (const policy of config.contextPolicies ?? []) {
       if (!policy.afterTool) continue;
       transformed = await abortable(
@@ -139,20 +206,23 @@ export async function executeTool<C>(
       );
       transformed = normalizeToolResult(transformed, Number.MAX_SAFE_INTEGER);
     }
-    return normalizeToolResult(transformed, limits.maxToolResultBytes);
+    yield { type: "result", result: normalizeToolResult(transformed, limits.maxToolResultBytes) };
   } catch (error) {
     if (!scope.signal.aborted && !executionStarted && error instanceof ToolInterrupt) throw error;
-    // 取消优先于迟到的业务错误，避免超时后又进入下一轮重试写操作。
     if (!scope.signal.aborted && !toolFinished && error instanceof ToolError) {
-      return normalizeToolResult(
-        {
-          ok: false,
-          code: error.code,
-          message: error.message,
-          retryableByModel: error.retryableByModel,
-        },
-        limits.maxToolResultBytes,
-      );
+      yield {
+        type: "result",
+        result: normalizeToolResult(
+          {
+            ok: false,
+            code: error.code,
+            message: error.message,
+            retryableByModel: error.retryableByModel,
+          },
+          limits.maxToolResultBytes,
+        ),
+      };
+      return;
     }
     let failure = error;
     if (scope.signal.aborted) {
@@ -167,5 +237,22 @@ export async function executeTool<C>(
   } finally {
     scope.cancel();
     scope.dispose();
+    if (iterator && !streamFinished)
+      void Promise.resolve()
+        .then(() => iterator!.return?.())
+        .catch(() => {});
   }
+}
+
+/** 保留非流式内部入口；与 Runner 使用同一执行路径，不会重复执行工具。 */
+export async function executeTool<C>(
+  registry: ToolRegistry<C>,
+  call: ToolCall,
+  context: ToolContext<C>,
+  config: AgentConfig<C>,
+  limits: Limits,
+): Promise<ToolResult> {
+  for await (const chunk of streamTool(registry, call, context, config, limits))
+    if (chunk.type === "result") return chunk.result;
+  throw new AgentError("invalid_tool_stream", "Tool ended without a result");
 }

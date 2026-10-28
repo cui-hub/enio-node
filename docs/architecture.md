@@ -7,7 +7,11 @@ flowchart TD
   App[业务宿主 / CLI] --> Runtime[createAgent / 单 Agent Loop]
   Runtime --> Protocol[protocol 类型与错误]
   Runtime --> Registry[ToolRegistry / ToolExecutor]
-  Runtime --> Model[ChatModel 接口]
+  Runtime --> ModelCall[模型尝试 / 重试 / 切换]
+  ModelCall --> Model[ChatModel 接口]
+  Runtime --> Middleware[AgentMiddleware / 生命周期与包装器]
+  Runtime --> Batch[安全读取批次 / 顺序屏障]
+  Batch --> Registry
   Runtime --> Instructions[AgentsMdLoader 接口]
   Runtime --> Policies[ContextPolicy / 摘要与清理]
   Runtime --> Checkpoints[CheckpointStore / 原子领取]
@@ -34,6 +38,8 @@ flowchart TD
 | src/protocol/types.ts              | 消息／事件判别联合、ToolContext、配置和预算        |
 | src/protocol/errors.ts             | 运行错误、可回填工具错误、模型重试错误             |
 | src/runtime/agent.ts               | 唯一执行循环，run 与 stream 共享；每次运行独立状态 |
+| src/runtime/model-call.ts          | 模型包装、候选切换、流协议与重试                   |
+| src/runtime/tool-batch.ts          | 受控并发、有限预取、中断收尾                       |
 | src/runtime/control.ts             | deadline、取消等待、UTF-8 体积限制                 |
 | src/runtime/history.ts             | 工具调用编号与历史配对检查                         |
 | src/tools/registry.ts              | Schema 子集、创建期校验与运行期参数验证            |
@@ -54,9 +60,9 @@ flowchart TD
 
 ## 循环及不变量
 
-每轮先完成已有工具批次，再检查下一次模型调用预算，执行上下文策略并生成请求快照，随后聚合完整模型响应。只有 finishReason 正常、工具批次结构合法且总预算充足，才追加 assistant 消息并执行工具。每个调用经过“注册查找→JSON 解析→Schema 校验→宿主权限→beforeTool→execute→结果外置策略→硬性限量”，结果通过 toolCallId 追加回历史。beforeTool 可以返回中断请求，保存状态后结束当前事件流。
+每次运行先经 beforeAgent 装配指令与工具。每轮先完成已有工具批次，再检查下一次模型调用预算，执行旧 beforeModel hook、上下文策略、请求组装和 middleware.beforeModel；随后经 wrapModel 调用模型、重试或切换候选，聚合完整响应，再经 afterModel 验证。只有 finishReason 正常、工具批次结构合法且总预算充足，才追加 assistant 消息并执行工具。每个调用经过“注册查找→JSON 解析→Schema 校验→宿主权限→beforeTool→wrapTool→stream 或 execute→结果外置策略→硬性限量”，最终结果通过 toolCallId 追加回历史；进度只发出 tool_output。beforeTool 可以返回中断请求，待当前只读批次收尾后保存状态并结束当前事件流。
 
-整个批次在开始副作用前检查编号重复、数量上限和参数体积。单个调用参数错误允许回填并继续，取消或致命错误停止余下调用，保留未完成编号。没有工具的正常模型回复才生成 completed；一期没有 returnDirectly。
+整个批次在开始副作用前检查编号重复、数量上限和参数体积。单个调用参数错误允许回填并继续，取消或致命错误停止余下调用，保留未完成编号。没有工具的正常模型回复，或同批工具全部完成且 returnDirect 工具成功时生成 completed；结束前执行 middleware.afterAgent，再执行旧 hooks.afterAgent。
 
 工具和 provider 都不直接修改消息历史。固定 instructions 只在每次请求组装时加入，不写入历史，因此宿主复用历史时不会重复累计指令。业务 context 可包含客户端，Runner 不克隆客户端；上下文类型只读，业务不应在并发 run 中修改共享身份。
 
@@ -89,13 +95,13 @@ sequenceDiagram
 
 缓存是 engine 的局部变量，而不是加载器或 Agent 的共享状态。首次模型请求之前加载一次，后续轮次和网络重试复用；同一 Agent 的下一次 run 重新读取。缺失／空结果也在当前 run 固定，避免工具中途创建文件导致规则悄然改变。模型请求和返回历史分开维护，复用历史不会累积指令副本；注入文本计入 `maxInputBytes`。
 
-对齐 Eino `adk/middlewares/agentsmd` 的核心行为：显式配置来源、递归引用、运行内复用和临时 user 消息。当前实现更明确地限制本地工作区范围，不自动搜索祖先目录；文件总数有上限，默认启用字节预算，最终文本的标题和截断提示也计入预算。没有通用中间件框架，也没有复制 Eino 的 RunLocal/State API。
+对齐 Eino `adk/middlewares/agentsmd` 的核心行为：显式配置来源、递归引用、运行内复用和临时 user 消息。当前实现更明确地限制本地工作区范围，不自动搜索祖先目录；文件总数有上限，默认启用字节预算，最终文本的标题和截断提示也计入预算。V3 已增加通用 AgentMiddleware 接口，agentsMd 保留专用加载入口；没有复制 Eino 的 RunLocal/State API。
 
 ## 取消和资源生命周期
 
 每次 stream 有独立 AbortController；运行、模型、工具 deadline 形成父子作用域。return()/break 主动取消引擎，SDK 关闭 SSE，执行 backend 清理进程组。作用域退出时释放 timer 与父信号监听器。
 
-异步生成器按消费者 next 的速度拉取，避免另建无限缓冲队列。对不响应取消的 Promise，框架结束等待并吸收迟到的拒绝；不能声称停止了底层操作。带副作用的调用中止或出现未分类错误时，返回 outcomeUnknown。
+异步生成器按消费者 next 的速度拉取。显式开启安全读取并发时，每个工具最多挂起一次 next；已启动的 I/O 可以继续，进程 backend 只缓存输出预算内的日志，避免无限缓冲队列。对不响应取消的 Promise，框架结束等待并吸收迟到的拒绝；不能声称停止了底层操作。带副作用的调用中止或出现未分类错误时，返回 outcomeUnknown。
 
 ## 扩展业务工具
 
@@ -117,11 +123,15 @@ Schema 的类型不会自动推导到泛型 A；作者须保持二者一致，�
 
 ## 长上下文与恢复
 
-`contextPolicies` 是本阶段的专用扩展接口，没有移植 Eino 的全套 Middleware。beforeModel 按顺序接收隔离快照，可以返回新的完整工作历史；runtime 校验工具配对，并保留压缩前的调用 ID。afterTool 在硬截断之前拿到完整工具结果。策略不能直接修改运行中的历史数组。
+`contextPolicies` 是 V2 的持久化上下文扩展接口；V3 新增 `middlewares` 用于生命周期、临时请求改写和调用包装。两者职责不同，不把临时指令写回工作历史，也未移植 Eino 的全套状态 API。beforeModel 按顺序接收隔离快照，可以返回新的完整工作历史；runtime 校验工具配对，并保留压缩前的调用 ID。afterTool 在硬截断之前拿到完整工具结果。策略不能直接修改运行中的历史数组。
 
 成功结束时提供 `AgentSnapshot` 和可等待的 `afterAgent` 钩子，用于宿主持久化。中断则存储含未完成尾部批次的 Checkpoint，通过 resume 优先执行待完成调用。存储的 take 必须原子校验并消费，恢复重新校验权限；context、模型实例和工具实现由宿主重新提供。
 
 具体默认值、状态区分、流程图与恢复限制见 [长上下文与恢复指南](context-and-resume.md)。
+
+## V3 单 Agent 扩展
+
+默认串行，只有显式声明 parallelSafe 的只读工具才进入并发批次；写入、命令和 returnDirect 工具形成顺序屏障。中断等待同批只读调用结束后保存剩余队列，避免恢复时重复读取。模型故障切换由 model-call 管理，成功候选在当前 run 中优先使用；已展示文本后禁止重放。完整契约和示例见 [V3 单 Agent 指南](v3-single-agent.md)。
 
 ## 后续阶段
 

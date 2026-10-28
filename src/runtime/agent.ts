@@ -1,12 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { AgentError, ModelError, toAgentError } from "../protocol/errors.js";
+import { AgentError, toAgentError } from "../protocol/errors.js";
 import type {
   Agent,
   AgentConfig,
   AgentEvent,
   EventPayloads,
   Message,
-  ModelChunk,
   ModelResponse,
   RunInput,
   RunOptions,
@@ -19,10 +18,13 @@ import type {
   ToolCall,
   ModelRequest,
   JsonValue,
+  MiddlewareContext,
+  ToolResult,
 } from "../protocol/types.js";
 import { ToolRegistry } from "../tools/registry.js";
-import { executeTool } from "../tools/executor.js";
-import { abortable, byteLength, checkAbort, createScope, delay, resolveLimits } from "./control.js";
+import { callModel } from "./model-call.js";
+import { selectBatch, runToolBatch } from "./tool-batch.js";
+import { abortable, byteLength, checkAbort, createScope, resolveLimits } from "./control.js";
 import { validateHistory, validateResponse } from "./history.js";
 import { assertJson, validateCheckpoint, validateSnapshot } from "./state.js";
 import { ToolInterrupt } from "./interrupt.js";
@@ -32,10 +34,17 @@ import { ToolInterrupt } from "./interrupt.js";
  * 返回。业务状态、历史、计数器和取消域都在每次迭代开始时新建。
  */
 export function createAgent<C = Record<string, never>>(configuration: AgentConfig<C>): Agent<C> {
+  if (configuration.modelFailover && !Array.isArray(configuration.modelFailover.models))
+    throw new AgentError("invalid_config", "modelFailover.models must be an array");
   const config = {
     ...configuration,
     hooks: { ...configuration.hooks },
     contextPolicies: [...(configuration.contextPolicies ?? [])],
+    middlewares: [...(configuration.middlewares ?? [])],
+    toolExecution: { ...configuration.toolExecution },
+    modelFailover: configuration.modelFailover
+      ? { ...configuration.modelFailover, models: [...configuration.modelFailover.models] }
+      : undefined,
     checkpoints: configuration.checkpoints ? { ...configuration.checkpoints } : undefined,
   };
   if (typeof config.model?.generate !== "function")
@@ -45,7 +54,31 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
   // 保留接收者，以支持 class 实现；创建 Agent 本身不读取文件。
   const loadAgentsMd = config.agentsMd?.load.bind(config.agentsMd);
   const baseLimits = resolveLimits(config.limits);
-  const registry = new ToolRegistry(config.tools ?? []);
+  const baseRegistry = new ToolRegistry(config.tools ?? []);
+  const maxConcurrency = config.toolExecution.maxConcurrency ?? 1;
+  if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 64)
+    throw new AgentError("invalid_config", "maxConcurrency must be an integer between 1 and 64");
+  if (
+    config.modelFailover?.models.some((model) => typeof model?.generate !== "function") ||
+    (config.modelFailover?.shouldFailover !== undefined &&
+      typeof config.modelFailover.shouldFailover !== "function")
+  )
+    throw new AgentError("invalid_config", "Invalid model failover configuration");
+  const middlewareNames = new Set<string>();
+  for (const middleware of config.middlewares) {
+    if (
+      !middleware?.name ||
+      middlewareNames.has(middleware.name) ||
+      ["beforeAgent", "beforeModel", "afterModel", "wrapModel", "wrapTool", "afterAgent"].some(
+        (key) => {
+          const value = middleware[key as keyof typeof middleware];
+          return value !== undefined && typeof value !== "function";
+        },
+      )
+    )
+      throw new AgentError("invalid_config", "Invalid or duplicate middleware");
+    middlewareNames.add(middleware.name);
+  }
   if (
     config.checkpoints &&
     (!config.checkpoints.namespace?.trim() ||
@@ -64,9 +97,22 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
   const fingerprint = JSON.stringify({
     namespace: config.checkpoints?.namespace,
     instructions: config.instructions,
-    tools: registry.definitions(),
+    tools: baseRegistry.definitions(),
     effects: config.tools?.map((tool) => tool.effect),
     policies: config.contextPolicies.map((policy) => policy.name),
+    // 未启用 V3 扩展时保持 V2 指纹结构，旧检查点可以继续恢复。
+    ...(config.middlewares.length ? { middlewares: [...middlewareNames] } : {}),
+    ...(maxConcurrency > 1 ? { maxConcurrency } : {}),
+    ...(config.modelFailover ? { fallbackCount: config.modelFailover.models.length } : {}),
+    ...((config.tools ?? []).some((tool) => tool.parallelSafe || tool.returnDirect)
+      ? {
+          behaviors: (config.tools ?? []).map((tool) => [
+            tool.name,
+            !!tool.parallelSafe,
+            !!tool.returnDirect,
+          ]),
+        }
+      : {}),
   });
   const bindingFor = (options: RunOptions<C>) => {
     if (!config.checkpoints)
@@ -78,13 +124,24 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
       .digest("hex");
   };
 
-  /** 自然背压：消费者没有请求下一个事件时，不读取下一片模型流或启动下个工具。 */
+  /**
+   * 拉取式背压：消费者暂停时不继续拉取模型流或启动下一工具批次。
+   * 已启动的并发工具仍可完成当前 next，每个工具最多预取一个片段；
+   * 真实进程的 stdout/stderr 由 backend 在输出字节预算内缓存。
+   */
   async function* engine(
     input: RunInput,
     options: RunOptions<C>,
     parent: AbortSignal,
     resumeInput?: ResumeInput,
   ): AsyncGenerator<AgentEvent> {
+    let registry = baseRegistry;
+    let runInstructions = config.instructions ?? "";
+    let setupSignature: string | undefined;
+    let restoredSetup: string | undefined;
+    let availableTools: Set<string> | undefined;
+    let activeModel = 0;
+    let returnedDirectly = false;
     let runId = randomUUID() as string;
     let limits = baseLimits;
     let iteration = 0;
@@ -118,6 +175,37 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
       });
     // 配置覆盖的非法值也走稳定终止事件，而非让异步迭代器意外抛错。
     let scope = createScope(parent, baseLimits.runTimeoutMs, "run_timeout");
+
+    const middlewareContext = (): MiddlewareContext<C> => ({
+      runId,
+      iteration,
+      context: options.context,
+      signal: scope.signal,
+      resumed: !!resumeInput,
+    });
+    const finish = async () => {
+      snapshot = validateSnapshot(capture());
+      for (const middleware of config.middlewares) {
+        if (middleware.afterAgent)
+          await abortable(
+            Promise.resolve().then(() =>
+              middleware.afterAgent!(structuredClone(snapshot!), middlewareContext()),
+            ),
+            scope.signal,
+          );
+      }
+      if (config.hooks.afterAgent)
+        await abortable(
+          Promise.resolve().then(() =>
+            config.hooks.afterAgent!(structuredClone(snapshot!), {
+              runId,
+              context: options.context,
+              signal: scope.signal,
+            }),
+          ),
+          scope.signal,
+        );
+    };
 
     const event = <K extends keyof EventPayloads>(
       type: K,
@@ -173,6 +261,11 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
         queue = restored.pendingCalls;
         queue.forEach((call) => pending.add(call.id));
         projectInstructions = restored.projectInstructions;
+        activeModel = restored.modelIndex ?? 0;
+        if (activeModel > (config.modelFailover?.models.length ?? 0))
+          throw new AgentError("checkpoint_mismatch", "Checkpoint model index is not configured");
+        restoredSetup = restored.setupSignature;
+        availableTools = restored.availableTools ? new Set(restored.availableTools) : undefined;
         limits = resolveLimits(restored.limits, options.limits);
         scope.dispose();
         scope = createScope(parent, limits.runTimeoutMs, "run_timeout");
@@ -209,8 +302,42 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
           throw new AgentError("invalid_agents_md", "agentsMd.load must return text");
       }
 
+      // 每个运行独立装配。工具函数保留接收者，元数据深拷贝，避免并发 run 串改配置。
+      let setup = {
+        instructions: runInstructions,
+        tools: baseRegistry.tools(),
+      };
+      for (const middleware of config.middlewares) {
+        if (!middleware.beforeAgent) continue;
+        const update = await abortable(
+          Promise.resolve().then(() => middleware.beforeAgent!(setup, middlewareContext())),
+          scope.signal,
+        );
+        if (update !== undefined) setup = update;
+        if (typeof setup?.instructions !== "string" || !Array.isArray(setup.tools))
+          throw new AgentError(
+            "invalid_middleware",
+            "beforeAgent must return instructions and tools",
+          );
+      }
+      registry = new ToolRegistry(setup.tools);
+      runInstructions = setup.instructions;
+      setupSignature = JSON.stringify({
+        instructions: runInstructions,
+        tools: registry.definitions(),
+        behaviors: setup.tools.map((tool) => [
+          tool.name,
+          tool.effect,
+          !!tool.parallelSafe,
+          !!tool.returnDirect,
+        ]),
+      });
+      if (restoredSetup !== undefined && restoredSetup !== setupSignature)
+        throw new AgentError("checkpoint_mismatch", "beforeAgent setup changed since interruption");
+
       while (true) {
         checkAbort(scope.signal);
+        const hadCalls = queue.length > 0;
         // 恢复时优先完成已有批次；已回填的调用不再执行，也不重复请求模型。
         while (queue.length) {
           if (
@@ -219,40 +346,74 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             queue.some((call) => byteLength(call.arguments) > limits.maxToolArgumentBytes)
           )
             throw new AgentError("limit_exceeded", "Pending tool batch exceeds current limits");
-          const call = queue[0]!;
-          checkAbort(scope.signal);
-          yield event("tool_call_ready", { call });
-          checkAbort(scope.signal);
-          callsCount++;
-          if (callsCount > limits.maxToolCalls)
-            throw new AgentError("limit_exceeded", "maxToolCalls exceeded");
-          yield event("tool_start", { id: call.id, name: call.name });
-          checkAbort(scope.signal);
-          let result;
-          try {
-            result = await executeTool(
-              registry,
-              call,
-              {
-                runId,
-                toolCallId: call.id,
-                signal: scope.signal,
-                context: options.context,
-                state,
-                ...(resumeData ? { resume: resumeData } : {}),
-              },
-              config,
-              limits,
-            );
-          } catch (cause) {
-            if (cause instanceof ToolInterrupt) callsCount--; // 还未执行，不消耗一次工具额度。
-            throw cause;
+          const batch = selectBatch(queue, registry, maxConcurrency);
+          // 只有消费方拉过开始事件后才启动本批次，最大在途调用数始终受配置约束。
+          for (const call of batch) {
+            checkAbort(scope.signal);
+            yield event("tool_call_ready", { call });
+            checkAbort(scope.signal);
+            callsCount++;
+            yield event("tool_start", { id: call.id, name: call.name });
           }
-          resumeData = undefined;
-          messages.push({ role: "tool", toolCallId: call.id, content: JSON.stringify(result) });
-          pending.delete(call.id);
-          queue.shift();
-          yield event("tool_end", { id: call.id, name: call.name, result });
+          const interruptedCalls = new Map<string, ToolInterrupt>();
+          const resumeId = resumeData ? queue[0]!.id : undefined;
+          for await (const item of runToolBatch({
+            calls: batch,
+            registry,
+            config,
+            limits,
+            availableTools,
+            context: { runId, signal: scope.signal, context: options.context, state },
+            ...(resumeId ? { resume: { id: resumeId, data: resumeData } } : {}),
+          })) {
+            if ("interrupt" in item) {
+              callsCount--; // 中断前尚未执行，不消耗工具额度。
+              interruptedCalls.set(item.call.id, item.interrupt);
+              continue;
+            }
+            if (item.chunk.type === "text_delta") {
+              yield event("tool_output", {
+                id: item.call.id,
+                name: item.call.name,
+                text: item.chunk.text,
+                ...(item.chunk.channel ? { channel: item.chunk.channel } : {}),
+              });
+              continue;
+            }
+            const result = item.chunk.result;
+            messages.push({
+              role: "tool",
+              toolCallId: item.call.id,
+              content: JSON.stringify(result),
+            });
+            pending.delete(item.call.id);
+            queue = queue.filter((call) => call.id !== item.call.id);
+            if (item.call.id === resumeId) resumeData = undefined;
+            yield event("tool_end", { id: item.call.id, name: item.call.name, result });
+          }
+          // 并发只读批次完全收尾后保存：queue 中只剩未执行项，已完成读取不会重放。
+          if (interruptedCalls.size) throw interruptedCalls.get(queue[0]!.id)!;
+        }
+        // 直接返回也须保持整个模型批次的工具配对；错误结果仍交给模型处理。
+        const lastAssistant = [...messages]
+          .reverse()
+          .find((message) => message.role === "assistant");
+        if (hadCalls && lastAssistant?.role === "assistant") {
+          const direct = lastAssistant.toolCalls?.find(
+            (call) => registry.behavior(call.name).returnDirect,
+          );
+          const output =
+            direct &&
+            messages.find((message) => message.role === "tool" && message.toolCallId === direct.id);
+          if (output) {
+            const result = JSON.parse(output.content) as ToolResult;
+            if (result.ok) {
+              finalText = result.content;
+              returnedDirectly = true;
+              await finish();
+              break;
+            }
+          }
         }
         if (iteration >= limits.maxIterations)
           throw new AgentError("limit_exceeded", "maxIterations exceeded");
@@ -285,8 +446,8 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             });
           }
           // 固定指令只组装进请求，不重复写入可复用历史，避免多次 run 累积副本。
-          if (config.instructions)
-            request.messages.unshift({ role: "system", content: config.instructions });
+          if (runInstructions)
+            request.messages.unshift({ role: "system", content: runInstructions });
           if (extra) request.messages.unshift({ role: "system", content: extra });
           return request;
         };
@@ -331,96 +492,47 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             afterBytes: byteLength(messages),
           });
         }
-        const request = buildRequest();
-        if (byteLength(request) > limits.maxInputBytes)
-          throw new AgentError("limit_exceeded", "maxInputBytes exceeded");
-
+        let request = buildRequest();
+        const validateRequest = (candidate: ModelRequest) => {
+          if (!candidate) throw new AgentError("invalid_middleware", "Model request is required");
+          validateHistory(candidate.messages);
+          registry.validateDefinitions(candidate.tools);
+          if (byteLength(candidate) > limits.maxInputBytes)
+            throw new AgentError("limit_exceeded", "maxInputBytes exceeded");
+          availableTools = new Set(candidate.tools.map((tool) => tool.name));
+        };
+        for (const middleware of config.middlewares) {
+          if (!middleware.beforeModel) continue;
+          const update = await abortable(
+            Promise.resolve().then(() =>
+              middleware.beforeModel!(structuredClone(request), middlewareContext()),
+            ),
+            scope.signal,
+          );
+          if (update !== undefined) request = structuredClone(update);
+          validateRequest(request);
+        }
+        validateRequest(request);
         let response: ModelResponse | undefined;
-        for (let attempt = 0; ; attempt++) {
-          checkAbort(scope.signal);
-          const modelScope = createScope(scope.signal, limits.modelTimeoutMs, "model_timeout");
-          let exposed = false;
-          let iterator: AsyncIterator<ModelChunk> | undefined;
-          let streamFinished = false;
-          let streamBytes = 0;
-          let streamedText = "";
-          let retry = false;
-          try {
-            yield event("model_start", { attempt: attempt + 1 });
-            checkAbort(modelScope.signal);
-            if (config.model.stream) {
-              iterator = config.model
-                .stream(structuredClone(request), modelScope.signal)
-                [Symbol.asyncIterator]();
-              while (true) {
-                const next = await abortable(
-                  Promise.resolve().then(() => iterator!.next()),
-                  modelScope.signal,
-                );
-                if (next.done) {
-                  streamFinished = true;
-                  break;
-                }
-                if (response)
-                  throw new AgentError(
-                    "protocol_error",
-                    "Chunks received after final model response",
-                  );
-                const chunk = next.value;
-                if (chunk.type === "text_delta" && typeof chunk.text === "string") {
-                  streamBytes += byteLength(chunk.text);
-                  if (streamBytes > limits.maxModelResponseBytes)
-                    throw new AgentError("limit_exceeded", "Model text exceeds response budget");
-                  streamedText += chunk.text;
-                  if (chunk.text) {
-                    exposed = true;
-                    yield event("text_delta", { text: chunk.text });
-                  }
-                } else if (chunk.type === "response") response = structuredClone(chunk.response);
-                else throw new AgentError("protocol_error", "Unknown model chunk");
-              }
-              if (!response)
-                throw new AgentError(
-                  "incomplete_response",
-                  "Model stream ended without a final response",
-                );
-              if (response.message.content !== streamedText)
-                throw new AgentError("protocol_error", "Stream text differs from final response");
-            } else {
-              response = structuredClone(
-                await abortable(
-                  Promise.resolve().then(() =>
-                    config.model.generate(structuredClone(request), modelScope.signal),
-                  ),
-                  modelScope.signal,
-                ),
-              );
-            }
-            checkAbort(modelScope.signal);
-          } catch (cause) {
-            usage.known = false; // 失败请求可能已消耗 token，缺少 usage 时不能报告为零费用。
-            response = undefined;
-            if (scope.signal.aborted) checkAbort(scope.signal);
-            if (modelScope.signal.aborted) checkAbort(modelScope.signal);
-            if (
-              cause instanceof ModelError &&
-              cause.retryable &&
-              !exposed &&
-              attempt < limits.maxModelRetries
-            )
-              retry = true;
-            else throw cause;
-          } finally {
-            modelScope.cancel();
-            modelScope.dispose();
-            // 不等待不合作的 iterator.return；signal 已取消时供应商必须自行释放 I/O。
-            if (iterator && !streamFinished)
-              void Promise.resolve(iterator.return?.()).catch(() => {});
-          }
-          if (!retry) break;
-          const delayMs = Math.min(limits.retryDelayMs * 2 ** attempt, 10_000);
-          yield event("model_retry", { attempt: attempt + 2, delayMs });
-          await delay(delayMs, scope.signal);
+        for await (const item of callModel({
+          config,
+          request,
+          context: middlewareContext(),
+          limits,
+          activeModel,
+          seen,
+          validateRequest,
+          onFailure: () => {
+            usage.known = false;
+          },
+        })) {
+          if (item.type === "response") {
+            response = item.response;
+            activeModel = item.modelIndex;
+          } else if (item.type === "text_delta") yield event("text_delta", item.payload);
+          else if (item.type === "model_start") yield event("model_start", item.payload);
+          else if (item.type === "model_retry") yield event("model_retry", item.payload);
+          else yield event("model_fallback", item.payload);
         }
 
         checkAbort(scope.signal);
@@ -429,6 +541,11 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
           throw new AgentError("limit_exceeded", "maxModelResponseBytes exceeded");
         validateResponse(response, seen);
         const calls = response.message.toolCalls ?? [];
+        if (calls.filter((call) => registry.behavior(call.name).returnDirect).length > 1)
+          throw new AgentError(
+            "protocol_error",
+            "A model batch may contain only one returnDirect tool",
+          );
         if (
           calls.length > limits.maxToolCallsPerRound ||
           callsCount + calls.length > limits.maxToolCalls
@@ -446,18 +563,7 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
         messages.push(response.message);
         if (!calls.length) {
           finalText = response.message.content;
-          snapshot = validateSnapshot(capture());
-          if (config.hooks.afterAgent)
-            await abortable(
-              Promise.resolve().then(() =>
-                config.hooks.afterAgent!(structuredClone(snapshot!), {
-                  runId,
-                  context: options.context,
-                  signal: scope.signal,
-                }),
-              ),
-              scope.signal,
-            );
+          await finish();
           break;
         }
         calls.forEach((call) => pending.add(call.id));
@@ -481,6 +587,9 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             projectInstructions,
             limits: { ...limits },
             info: cause.info,
+            modelIndex: activeModel,
+            ...(setupSignature ? { setupSignature } : {}),
+            ...(availableTools ? { availableTools: [...availableTools] } : {}),
           };
           await abortable(config.checkpoints!.store.save(checkpoint, scope.signal), scope.signal);
           interrupted = { checkpointId, call: structuredClone(queue[0]!), info: cause.info };
@@ -502,7 +611,8 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
         : interrupted
           ? "interrupted"
           : "completed",
-      stopReason: error?.code ?? (interrupted ? "interrupt" : "stop"),
+      stopReason:
+        error?.code ?? (interrupted ? "interrupt" : returnedDirectly ? "return_direct" : "stop"),
       finalText,
       messages: structuredClone(messages),
       historyComplete: inputValid && pending.size === 0,

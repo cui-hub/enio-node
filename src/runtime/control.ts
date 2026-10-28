@@ -15,6 +15,7 @@ export const DEFAULT_LIMITS: Readonly<Limits> = Object.freeze({
   maxToolResultBytes: 32_768,
   maxInputBytes: 1_048_576,
   maxModelResponseBytes: 1_048_576,
+  maxToolStreamBytes: 1_048_576,
 });
 
 /** 限制值来自业务配置，也必须在运行时校验，拒绝 NaN、负数和无效键。 */

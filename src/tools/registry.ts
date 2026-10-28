@@ -76,7 +76,11 @@ export class ToolRegistry<C> {
         typeof original.description !== "string" ||
         !original.description ||
         typeof original.execute !== "function" ||
-        !["read", "write", "execute"].includes(original.effect)
+        !["read", "write", "execute"].includes(original.effect) ||
+        (original.stream !== undefined && typeof original.stream !== "function") ||
+        (original.parallelSafe !== undefined && typeof original.parallelSafe !== "boolean") ||
+        (original.parallelSafe === true && original.effect !== "read") ||
+        (original.returnDirect !== undefined && typeof original.returnDirect !== "boolean")
       ) {
         throw new AgentError("invalid_config", `Invalid tool definition: ${original.name}`);
       }
@@ -86,7 +90,12 @@ export class ToolRegistry<C> {
         throw new AgentError("invalid_config", "Tool schema root must be object");
       try {
         this.entries.set(original.name, {
-          tool: { ...original, inputSchema },
+          tool: {
+            ...original,
+            inputSchema,
+            execute: original.execute.bind(original),
+            ...(original.stream ? { stream: original.stream.bind(original) } : {}),
+          },
           validate: ajv.compile(inputSchema),
         });
       } catch {
@@ -104,6 +113,41 @@ export class ToolRegistry<C> {
         inputSchema: tool.inputSchema,
       })),
     );
+  }
+
+  /** 每个 run 的装配副本；保留已绑定的函数，同时隔离可变 Schema。 */
+  tools(): Tool<unknown, C>[] {
+    return [...this.entries.values()].map(({ tool }) => ({
+      ...tool,
+      inputSchema: structuredClone(tool.inputSchema),
+    }));
+  }
+
+  /** 调度元数据不暴露执行函数；未知工具仍由 prepare 生成可回填错误。 */
+  behavior(name: string): { parallelSafe: boolean; returnDirect: boolean } {
+    const tool = this.entries.get(name)?.tool;
+    return { parallelSafe: tool?.parallelSafe === true, returnDirect: tool?.returnDirect === true };
+  }
+
+  /** 模型可见集合可以收窄，但不能伪造未注册工具或改变其参数契约。 */
+  validateDefinitions(definitions: ToolDefinition[]): void {
+    if (!Array.isArray(definitions))
+      throw new AgentError("invalid_middleware", "Tools must be an array");
+    const names = new Set<string>();
+    for (const definition of definitions) {
+      const original = this.entries.get(definition?.name)?.tool;
+      if (
+        !original ||
+        names.has(definition.name) ||
+        JSON.stringify(original.inputSchema) !== JSON.stringify(definition.inputSchema) ||
+        typeof definition.description !== "string"
+      )
+        throw new AgentError(
+          "invalid_middleware",
+          "Middleware must select registered tool schemas",
+        );
+      names.add(definition.name);
+    }
   }
 
   /** 参数错误属于模型可修正错误；不执行函数、不隐式强制转换字段类型。 */

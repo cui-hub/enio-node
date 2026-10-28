@@ -31,7 +31,8 @@
     "demo:instructions": "tsx examples/project-instructions.ts",
     "demo:context": "tsx examples/context-resume.ts",
     "demo:live": "tsx examples/file-report.ts --live",
-    "check": "pnpm run format:check && pnpm run typecheck && pnpm run test && pnpm run build"
+    "check": "corepack pnpm run format:check && corepack pnpm run typecheck && corepack pnpm run test && corepack pnpm run build",
+    "demo:v3": "tsx examples/single-agent-v3.ts"
   },
   "dependencies": {
     "ajv": "8.20.0",
