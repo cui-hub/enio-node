@@ -1,16 +1,31 @@
 import { parseDocument } from "yaml";
 import { AgentError, ToolError } from "../protocol/errors.js";
-import type { Tool } from "../protocol/types.js";
+import type {
+  Agent,
+  AgentConfig,
+  ChatModel,
+  JsonValue,
+  Tool,
+  ToolChunk,
+  ToolContext,
+} from "../protocol/types.js";
 import { defineTool } from "../tools/registry.js";
 import { abortable, byteLength, checkAbort } from "../runtime/control.js";
 import { LocalFileStore } from "../backends/local-filesystem.js";
+import { createAgent } from "../runtime/agent.js";
+import { AgentToolInterrupt } from "../runtime/interrupt.js";
+import { createAgentTool } from "../builtins/agent.js";
 
 /** name/description 在创建时发现，正文仅在 skill 工具被调用时进入模型上下文。 */
 export interface SkillMetadata {
   name: string;
   description: string;
+  context?: "inline" | "fork" | "fork_with_context";
+  /** 只允许选择宿主 fork.agents / fork.models 中的键，不能提供任意配置或凭证。 */
+  agent?: string;
+  model?: string;
 }
-/** 一期仅支持 inline；资源目录不会自动变成 execute 权限。 */
+/** 正文是指令文本；资源目录不会自动变成文件或 execute 权限。 */
 export interface Skill extends SkillMetadata {
   content: string;
   baseDirectory?: string;
@@ -21,7 +36,7 @@ export interface SkillBackend {
   get(name: string, signal: AbortSignal): Promise<Skill>;
 }
 
-/** 外部 backend 也要校验模式；拒绝 fork、模型覆盖及未知可执行配置。 */
+/** 外部 backend 同样校验模式；inline 不允许改变运行中的 Agent 或模型。 */
 function validateSkill(value: unknown, bodyRequired = false): asserts value is Skill {
   if (!value || typeof value !== "object")
     throw new AgentError("invalid_skill", "Skill must be an object");
@@ -35,13 +50,19 @@ function validateSkill(value: unknown, bodyRequired = false): asserts value is S
   )
     throw new AgentError("invalid_skill", "Invalid skill name or description");
   if (
-    (skill.context !== undefined && skill.context !== "inline") ||
-    skill.agent !== undefined ||
-    skill.model !== undefined
+    (skill.context !== undefined &&
+      !["inline", "fork", "fork_with_context"].includes(skill.context as string)) ||
+    [skill.agent, skill.model].some(
+      (key) =>
+        key !== undefined &&
+        (typeof key !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(key)),
+    ) ||
+    ((skill.context === undefined || skill.context === "inline") &&
+      (skill.agent !== undefined || skill.model !== undefined))
   )
     throw new AgentError(
       "unsupported_skill",
-      "Only inline skills without agent/model overrides are supported",
+      "Unsupported skill mode or inline agent/model override",
     );
   if (
     bodyRequired &&
@@ -91,7 +112,13 @@ export function createFilesystemSkills({ root }: { root: string }): SkillBackend
         if (discovered.has(skill.name))
           throw new AgentError("invalid_skill", "Duplicate skill name");
         discovered.set(skill.name, file);
-        metadata.push({ name: skill.name, description: skill.description });
+        metadata.push({
+          name: skill.name,
+          description: skill.description,
+          ...(skill.context ? { context: skill.context } : {}),
+          ...(skill.agent ? { agent: skill.agent } : {}),
+          ...(skill.model ? { model: skill.model } : {}),
+        });
       }
       files.clear();
       discovered.forEach((file, name) => files.set(name, file));
@@ -109,48 +136,174 @@ export function createFilesystemSkills({ root }: { root: string }): SkillBackend
   };
 }
 
+/** Skill fork 只选择宿主提供的配置，不从 Markdown 构造客户端或授予执行权限。 */
+export interface SkillForkOptions<C> {
+  agents: Record<string, AgentConfig<C>>;
+  defaultAgent?: string;
+  models?: Record<string, ChatModel>;
+}
+export interface SkillToolOptions<C> {
+  backend: SkillBackend;
+  signal?: AbortSignal;
+  fork?: SkillForkOptions<C>;
+}
+
 /**
- * 显式异步初始化便于启动时发现配置错误，createAgent 自身仍保持同步。
- * 构建工具不会授予额外能力；加载结果只作为普通 ToolResult 回填当前 Agent。
+ * 显式异步发现目录；inline 原样返回正文，fork 把正文交给独立 Agent。
+ * 恢复时只使用已保存的子检查点，不重新加载可能变化的技能正文或执行已完成步骤。
  */
 export async function createSkillTool<C = unknown>({
   backend,
   signal = AbortSignal.timeout(30_000),
-}: {
-  backend: SkillBackend;
-  signal?: AbortSignal;
-}): Promise<Tool<{ skill: string }, C>> {
+  fork,
+}: SkillToolOptions<C>): Promise<Tool<{ skill: string; request?: string }, C>> {
   checkAbort(signal);
-  const metadata = await abortable(
-    Promise.resolve().then(() => backend.list(signal)),
-    signal,
+  const metadata = structuredClone(
+    await abortable(
+      Promise.resolve().then(() => backend.list(signal)),
+      signal,
+    ),
   );
-  if (metadata.length > 200) throw new AgentError("invalid_skill", "Too many skills");
+  if (!Array.isArray(metadata) || metadata.length > 200)
+    throw new AgentError("invalid_skill", "Too many skills or invalid catalog");
   metadata.forEach((item) => validateSkill(item));
-  const names = new Set(metadata.map((item) => item.name));
-  if (names.size !== metadata.length) throw new AgentError("invalid_skill", "Duplicate skill name");
-  const description =
-    "按名称加载 inline Skill 指令；不启动子 Agent、不执行脚本。\n" +
-    metadata.map((item) => `${item.name}: ${item.description}`).join("\n");
+  const catalog = new Map(metadata.map((item) => [item.name, item]));
+  if (catalog.size !== metadata.length)
+    throw new AgentError("invalid_skill", "Duplicate skill name");
+  const hasFork = metadata.some(
+    (item) => item.context === "fork" || item.context === "fork_with_context",
+  );
+  if (hasFork && !fork)
+    throw new AgentError(
+      "unsupported_skill",
+      "Fork skills require an explicit host Agent registry",
+    );
+  const agentConfigs = new Map(Object.entries(fork?.agents ?? {}));
+  const models = new Map(Object.entries(fork?.models ?? {}));
+  const defaultAgent =
+    fork?.defaultAgent ?? (agentConfigs.size === 1 ? [...agentConfigs.keys()][0] : undefined);
+  const children = new Map<string, Agent<C>>();
+  const routes = new Map<string, { name: string; signature: string }>();
+  const routeOf = (skill: SkillMetadata) =>
+    JSON.stringify([skill.context ?? "inline", skill.agent ?? defaultAgent, skill.model ?? null]);
+  for (const item of metadata) {
+    if (item.context !== "fork" && item.context !== "fork_with_context") continue;
+    const key = item.agent ?? defaultAgent;
+    const configuration = key ? agentConfigs.get(key) : undefined;
+    if (!key || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(key) || !configuration)
+      throw new AgentError("invalid_skill", "Fork Agent is not registered by the host");
+    const model = item.model ? models.get(item.model) : configuration.model;
+    if (!model) throw new AgentError("invalid_skill", "Fork model is not registered by the host");
+    // namespace 区分技能、Agent 和显式模型键；实现变化仍由宿主升级自己的 namespace。
+    children.set(
+      item.name,
+      createAgent({
+        ...configuration,
+        model,
+        ...(configuration.checkpoints
+          ? {
+              checkpoints: {
+                ...configuration.checkpoints,
+                namespace: `${configuration.checkpoints.namespace}/skill/${item.name}/${key}/${item.model ?? "default"}`,
+              },
+            }
+          : {}),
+      }),
+    );
+    routes.set(item.name, { name: key, signature: routeOf(item) });
+  }
+  const description = hasFork
+    ? "按名称使用 Skill。inline 返回正文；fork 在独立 Agent 中执行；fork_with_context 继承完整父对话。\n" +
+      metadata
+        .map(
+          (item) =>
+            `${item.name}: ${item.description} [${item.context ?? "inline"}, agent=${item.agent ?? defaultAgent ?? "-"}, model=${item.model ?? "default"}]`,
+        )
+        .join("\n")
+    : "按名称加载 inline Skill 指令；不启动子 Agent、不执行脚本。\n" +
+      metadata.map((item) => `${item.name}: ${item.description}`).join("\n");
   if (byteLength(description) > 32_768)
     throw new AgentError("invalid_skill", "Skill catalog is too large");
+
+  async function* stream(
+    args: { skill: string; request?: string },
+    ctx: ToolContext<C>,
+  ): AsyncGenerator<ToolChunk> {
+    const entry = catalog.get(args.skill);
+    if (!entry) throw new ToolError("skill_not_found", "Skill is not registered");
+    const route = routes.get(args.skill);
+    let content = "";
+    let continuation = ctx.continuation;
+    if (continuation !== undefined) {
+      const saved = continuation as {
+        kind?: string;
+        skill?: string;
+        route?: string;
+        child?: JsonValue;
+      };
+      if (
+        !saved ||
+        saved.kind !== "skill-fork" ||
+        saved.skill !== args.skill ||
+        !route ||
+        saved.route !== route.signature ||
+        saved.child === undefined
+      )
+        throw new AgentError("checkpoint_mismatch", "Skill route changed since interruption");
+      continuation = saved.child;
+    } else {
+      const skill = await backend.get(args.skill, ctx.signal);
+      validateSkill(skill, true);
+      if (skill.name !== args.skill || routeOf(skill) !== routeOf(entry))
+        throw new AgentError(
+          "invalid_skill",
+          "Skill identity or execution mode changed after discovery",
+        );
+      content = `Skill: ${skill.name}\n${skill.content}`;
+    }
+    if (!route) {
+      yield { type: "result", result: { ok: true, content } };
+      return;
+    }
+    const child = createAgentTool({
+      name: route.name,
+      description: entry.description,
+      agent: children.get(args.skill)!,
+      history: entry.context === "fork_with_context" ? "inherit" : "isolated",
+    });
+    try {
+      yield* child.stream!(
+        { request: content + (args.request ? `\n\n任务要求：${args.request}` : "") },
+        { ...ctx, ...(continuation !== undefined ? { continuation } : {}) },
+      );
+    } catch (error) {
+      if (error instanceof AgentToolInterrupt)
+        throw new AgentToolInterrupt(error.info, {
+          kind: "skill-fork",
+          skill: args.skill,
+          route: route.signature,
+          child: error.continuation,
+        });
+      throw error;
+    }
+  }
   return defineTool({
     name: "skill",
     description,
-    effect: "read",
+    effect: hasFork ? "execute" : "read",
+    ...(hasFork ? { delegates: true, stream } : {}),
     inputSchema: {
       type: "object",
       required: ["skill"],
       additionalProperties: false,
-      properties: { skill: { type: "string", minLength: 1, maxLength: 64 } },
+      properties: {
+        skill: { type: "string", minLength: 1, maxLength: 64 },
+        ...(hasFork ? { request: { type: "string", maxLength: 8192 } } : {}),
+      },
     },
-    async execute({ skill: name }, ctx) {
-      if (!names.has(name)) throw new ToolError("skill_not_found", "Skill is not registered");
-      const skill = await backend.get(name, ctx.signal);
-      validateSkill(skill, true);
-      if (skill.name !== name)
-        throw new AgentError("invalid_skill", "Skill backend returned a different identity");
-      return { ok: true, content: `Skill: ${skill.name}\n${skill.content}` };
+    async execute(args, ctx) {
+      for await (const chunk of stream(args, ctx)) if (chunk.type === "result") return chunk.result;
+      throw new AgentError("incomplete_agent_run", "Skill did not produce a result");
     },
   });
 }

@@ -1,10 +1,10 @@
 # enio-node
 
-用于学习 Agent 框架设计的 Node.js + TypeScript 单 Agent SDK，参考 [Eino](https://github.com/cloudwego/eino) 的模型／工具循环和扩展边界实现。项目名按约定使用 **enio-node**；它是独立实现，不是 Eino 官方 TypeScript 版本。
+用于学习 Agent 框架设计的 Node.js + TypeScript Agent SDK，参考 [Eino](https://github.com/cloudwego/eino) 的模型／工具循环和扩展边界实现。项目名按约定使用 **enio-node**；它是独立实现，不是 Eino 官方 TypeScript 版本。
 
 项目仓库：[cui-hub/enio-node](https://github.com/cui-hub/enio-node)。建议结合源码注释、架构文档和离线示例理解模型调用、工具执行与运行时控制的完整链路。
 
-已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、inline Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。V2 增加历史摘要、工具结果外置、工作状态导出和工具执行前的持久化中断恢复；V3 增加生命周期中间件、模型／工具包装器、工具流式输出、受控并发、工具直接返回及主模型故障切换。子 Agent、Graph、Workflow 与业务审批系统留到后续阶段。
+已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。V2 增加历史摘要、工具结果外置、工作状态导出和工具执行前的持久化中断恢复；V3 增加生命周期中间件、模型／工具包装器、工具流式输出、受控并发、工具直接返回及主模型故障切换。V4 增加 AgentTool、子任务隔离、嵌套事件和中断恢复、Skill fork，以及 DeepAgent 风格的预置装配。Graph、Workflow 与业务审批系统留到后续阶段。
 
 ## 快速运行
 
@@ -24,6 +24,7 @@ corepack pnpm run demo
 corepack pnpm run demo:business
 corepack pnpm run demo:instructions
 corepack pnpm run demo:v3
+corepack pnpm run demo:v4
 
 nvm use "$task_node_before"
 ```
@@ -41,6 +42,7 @@ nvm use "$task_node_before"
 | `pnpm run demo:business` | 展示业务工具与宿主身份上下文                   |
 | `pnpm run demo:context`  | 演示摘要、结果外置、确认中断与新实例恢复       |
 | `pnpm run demo:v3`       | 演示中间件、流式工具、并发、直接返回与模型切换 |
+| `pnpm run demo:v4`       | 演示 Skill fork、子任务、确认中断与新实例恢复  |
 | `pnpm run demo:live`     | 使用宿主配置的真实模型完成文件任务             |
 | `pnpm run test:live`     | 显式执行会产生模型费用的集成验收               |
 
@@ -117,13 +119,14 @@ const model = createOpenAICompatibleModel({
 
 ## Tool 与 Skill
 
-| 能力     | 接入方式                                            | 执行行为                                   |
-| -------- | --------------------------------------------------- | ------------------------------------------ |
-| 业务工具 | `defineTool` 后加入 `tools`                         | 校验参数和权限，再调用业务函数             |
-| 文件工具 | `createFileTools({ backend })`                      | 同一执行器调用内存或本地 backend           |
-| 待办     | `createTodoTool()`                                  | 替换当前 run 的 todos，可随快照/检查点保存 |
-| Skill    | `await createSkillTool({ backend })` 后加入 `tools` | 元数据预加载，正文按需回填当前 Agent       |
-| 命令执行 | `createExecuteTool({ backend })`                    | 只有显式注册才开放；默认文件示例不注册     |
+| 能力     | 接入方式                                                   | 执行行为                                     |
+| -------- | ---------------------------------------------------------- | -------------------------------------------- |
+| 业务工具 | `defineTool` 后加入 `tools`                                | 校验参数和权限，再调用业务函数               |
+| 文件工具 | `createFileTools({ backend })`                             | 同一执行器调用内存或本地 backend             |
+| 待办     | `createTodoTool()`                                         | 替换当前 run 的 todos，可随快照/检查点保存   |
+| Skill    | `await createSkillTool({ backend, fork? })` 后加入 `tools` | inline 返回正文；fork 交给宿主注册的子 Agent |
+| 子任务   | `createAgentTool` / `createTaskTool` 后加入 `tools`        | 独立运行，回填最终文本并传播嵌套事件         |
+| 命令执行 | `createExecuteTool({ backend })`                           | 只有显式注册才开放；默认文件示例不注册       |
 
 ```typescript
 const backend = createLocalFilesystem({
@@ -140,7 +143,7 @@ const agent = createAgent({
 });
 ```
 
-这里将方案中的自动 Skill 配置收敛为**显式异步工厂**：创建工具时验证元数据，`createAgent` 保持同步。工具调用和 inline Skill 的执行链路没有变化。每个 Skill 位于技能根目录的一级子目录，包含 `SKILL.md`，格式见 [报告 Skill](examples/skills/report-summary/SKILL.md)。一期明确拒绝 fork、fork_with_context、agent/model 覆盖。
+这里将方案中的自动 Skill 配置收敛为**显式异步工厂**：创建工具时验证元数据，`createAgent` 保持同步。每个 Skill 位于技能根目录的一级子目录，包含 `SKILL.md`，格式见 [报告 Skill](examples/skills/report-summary/SKILL.md)。默认 inline；V4 显式提供 fork 注册表后，可启用 fork、fork_with_context 和宿主注册的 agent/model 选择。inline 不允许切换 Agent/模型，未配置注册表时仍拒绝 fork。
 
 文件工具包括 `ls`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`。默认文件 backend 只读，写入需要 `writable` 白名单。创建文件默认不覆盖；覆盖或编辑须提供最近一次读取返回的 `expectedHash`。编辑采用唯一的精确文本匹配。`grep` 使用字面量；大文件、遍历数量、深度、扫描字节数和返回体积均受限。
 
@@ -215,6 +218,8 @@ AGENTS.md 中可引用其他文件，例如：
 
 ## 流式事件与运行结果
 
+V4 子任务通过 `agent_event` 返回 `{path, event}`，内层事件保持子 runId/seq；父模型只收到子 finalText。完整 API、UML、调用时序和示例见 [V4 子 Agent 指南](docs/v4-subagents.md)。
+
 ```typescript
 const controller = new AbortController();
 for await (const event of agent.stream(
@@ -243,6 +248,7 @@ for await (const event of agent.stream(
 | -------- | ------------------------------------------------------------ |
 | 模型轮数 | 20；网络重试单独计数                                         |
 | 工具调用 | 总计 64，单轮最多 8，默认串行，可显式并发安全读取            |
+| 子任务   | 全树默认最多 4 层、启动 32 次；委派串行，预算跨中断累计      |
 | 超时     | run 120s、model 60s、tool 30s；父级取消优先                  |
 | 重试     | 模型可重试网络／429／5xx 错误最多 2 次；已经暴露文本后不重试 |
 | 体积     | 工具参数／结果各 32 KiB；工具进度、模型输入／响应各 1 MiB    |
@@ -257,6 +263,7 @@ for await (const event of agent.stream(
 
 - [架构与扩展方式](docs/architecture.md)：模块依赖、循环和取消链路。
 - [V3 单 Agent 指南](docs/v3-single-agent.md)：中间件、工具流、并发、直接返回与模型切换。
+- [V4 子 Agent 指南](docs/v4-subagents.md)：AgentTool、隔离、嵌套事件与恢复、Skill fork、DeepAgent 装配。
 - [长上下文与恢复指南](docs/context-and-resume.md)：摘要、外置、快照、中断与存储契约。
 - [验收记录](docs/acceptance.md)：各阶段对应测试与未验证部分。
 - [Eino 源码](https://github.com/cloudwego/eino)：参考框架，可对照理解 Go 与 TypeScript 的实现方式。

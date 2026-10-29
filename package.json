@@ -2,7 +2,7 @@
   "name": "enio-node",
   "version": "0.1.0",
   "private": true,
-  "description": "A small, documented single-agent runtime inspired by Eino",
+  "description": "A small, documented agent runtime with sub-agent delegation inspired by Eino",
   "type": "module",
   "engines": {
     "node": ">=24.19.0 <25"
@@ -32,7 +32,8 @@
     "demo:context": "tsx examples/context-resume.ts",
     "demo:live": "tsx examples/file-report.ts --live",
     "check": "corepack pnpm run format:check && corepack pnpm run typecheck && corepack pnpm run test && corepack pnpm run build",
-    "demo:v3": "tsx examples/single-agent-v3.ts"
+    "demo:v3": "tsx examples/single-agent-v3.ts",
+    "demo:v4": "tsx examples/subagents-v4.ts"
   },
   "dependencies": {
     "ajv": "8.20.0",

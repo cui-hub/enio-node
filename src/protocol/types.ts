@@ -70,6 +70,28 @@ export interface ToolContext<C = unknown> {
   state: RunState;
   /** 仅中断所在调用收到恢复数据。恢复仍经过权限检查与 beforeTool。 */
   resume?: { data: JsonValue };
+  /** 仅委派工具收到的完整历史副本；不包含当前未完成工具批次或临时系统指令。 */
+  messages?: Message[];
+  /** 子任务继续执行所需的 JSON 引用，由框架保存和恢复，不是模型参数。 */
+  continuation?: JsonValue;
+  /** 内部传播运行树预算和路径；工具作者不得修改其计数器。 */
+  delegation?: DelegationScope;
+  /** 宿主身份只供子任务派生检查点绑定，不发送给模型或事件。 */
+  checkpointOwner?: string;
+}
+
+/** 路径中的每一段描述由哪个父调用进入哪个子 Agent，重名任务也可准确区分。 */
+export interface AgentPathStep {
+  name: string;
+  parentRunId: string;
+  toolCallId: string;
+}
+
+/** 同一运行树共享调用计数；消息和 todos 则各 Agent 独立。恢复时重建共享引用。 */
+export interface DelegationScope {
+  path: AgentPathStep[];
+  maxDepth: number;
+  budget: { maxCalls: number; calls: number };
 }
 
 /** execute 使用方法签名，允许不同参数类型的工具进入同一注册表。 */
@@ -79,6 +101,8 @@ export interface Tool<A = unknown, C = unknown> extends ToolDefinition {
   parallelSafe?: boolean;
   /** 成功结果作为最终回答；同一模型批次最多一个，仍会完成批次内其他调用。 */
   returnDirect?: boolean;
+  /** AgentTool / fork Skill 使用；委派工具始终串行，允许传播可恢复子任务中断。 */
+  delegates?: boolean;
   execute(args: A, context: ToolContext<C>): Promise<ToolResult>;
   /** 存在时 Runner 优先消费此流。须以唯一 result 片段结束；execute 保留兼容入口。 */
   stream?(args: A, context: ToolContext<C>): AsyncIterable<ToolChunk>;
@@ -87,6 +111,7 @@ export interface Tool<A = unknown, C = unknown> extends ToolDefinition {
 /** 进度是展示数据，不写入历史；最终 result 才经过外置/截断并回填模型。 */
 export type ToolChunk =
   | { type: "text_delta"; text: string; channel?: "stdout" | "stderr" }
+  | { type: "agent_event"; path: AgentPathStep[]; event: LocalAgentEvent }
   | { type: "result"; result: ToolResult };
 
 /** 未收到 usage 时不能把费用当作零；known=false 表示统计不完整。 */
@@ -231,6 +256,12 @@ export interface Checkpoint {
   setupSignature?: string;
   /** 保存发生中断的模型轮次可见工具集合；恢复时仍不能调用被隐藏的工具。 */
   availableTools?: string[];
+  /** V4：待执行委派调用的子检查点引用；已完成调用不会留在这里。 */
+  continuations?: Record<string, JsonValue>;
+  /** V4：运行树预算与当前路径，调用次数跨中断累计。 */
+  delegation?: DelegationScope;
+  /** V4：已计入父 usage 的直接子任务累计用量，用于恢复后按差额统计。 */
+  childUsage?: Record<string, Usage & { known: boolean }>;
 }
 
 /**
@@ -313,7 +344,7 @@ export interface RunResult {
 }
 
 /** 事件判别联合允许业务在检查 type 后安全读取 payload。 */
-export interface EventPayloads {
+export interface LocalEventPayloads {
   run_start: Record<string, never>;
   model_start: { attempt: number; modelIndex?: number };
   text_delta: { text: string };
@@ -329,18 +360,25 @@ export interface EventPayloads {
   run_end: { result: RunResult };
 }
 
-/** seq 只保证单次 run 内有序；协议版本独立于包版本。 */
-export type AgentEvent = {
-  [K in keyof EventPayloads]: {
+/** 子事件保持原 runId/seq；多层委派只增加 path，不反复嵌套整个事件信封。 */
+export interface EventPayloads extends LocalEventPayloads {
+  agent_event: { path: AgentPathStep[]; event: LocalAgentEvent };
+}
+
+type Events<P> = {
+  [K in keyof P]: {
     schemaVersion: 1;
     runId: string;
     seq: number;
     iteration: number;
     timestamp: string;
     type: K;
-    payload: EventPayloads[K];
+    payload: P[K];
   };
-}[keyof EventPayloads];
+}[keyof P];
+export type LocalAgentEvent = Events<LocalEventPayloads>;
+/** seq 只保证单次 run 内有序；协议版本独立于包版本。 */
+export type AgentEvent = Events<EventPayloads>;
 
 /** hooks 只处理当前请求或调用，不直接改写历史，也不能绕过权限。 */
 export interface Hooks<C> {
@@ -378,6 +416,8 @@ export interface AgentConfig<C> {
   middlewares?: AgentMiddleware<C>[];
   /** 默认 1；只并发连续且 parallelSafe=true 的只读调用，其他调用是顺序屏障。 */
   toolExecution?: { maxConcurrency?: number };
+  /** 默认最多嵌套 4 层、启动 32 个子任务。maxCalls 由根运行统一控制；子级可收紧 maxDepth。 */
+  delegation?: { maxDepth?: number; maxCalls?: number };
   instructions?: string;
   /** 可选项目指令加载器；按 Eino 的方式作为临时 user 消息注入模型请求。 */
   agentsMd?: AgentsMdLoader;
@@ -401,6 +441,8 @@ export interface RunOptions<C> {
   limits?: Partial<Limits>;
   /** 启用检查点时必传；由宿主根据登录身份/会话生成，不接受模型指定。 */
   checkpointOwner?: string;
+  /** 框架委派入口使用；应用通常省略，不应自行伪造路径或修改共享预算。 */
+  delegation?: DelegationScope;
 }
 
 export interface ResumeInput {

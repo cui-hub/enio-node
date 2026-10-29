@@ -1,10 +1,10 @@
 # 验收记录
 
-最近复验：2026-10-27（一期首次验收：2026-10-16）。环境：macOS、Node.js 24.19.0、pnpm 12.11.2。原 Node.js v18.20.4 在每次构建／测试命令结束时通过 nvm 恢复；未改写 shell 启动配置。
+最近复验：2026-10-28（一期首次验收：2026-10-16）。环境：macOS、Node.js 24.19.0、pnpm 12.11.2。原 Node.js v18.20.4 在构建／测试命令结束后通过 nvm 恢复；未改写 shell 启动配置。
 
 ## 已验证
 
-格式检查、类型检查、156 项离线测试、ESM 构建、五个离线示例和构建后直接返回／状态序列化检查均执行通过，无依赖变更。V2 的 115 项测试全部保留；V3 新增 41 项中间件、工具流、受控并发、直接返回、主模型切换及恢复兼容性测试。冻结锁文件安装及构建后“模型→文件工具→最终回答”检查已在一期首次验收通过。默认测试集另有 1 项显式跳过的真实模型测试；它需要 ENIO_API_KEY、ENIO_MODEL 和可选网关地址。下表区分代码能力、确定性测试与外部环境验收。
+格式检查、类型检查、191 项离线测试、ESM 构建、六个离线示例和构建后子 Agent 执行／状态序列化检查均执行通过，无依赖变更。V3 的 156 项测试全部保留，V4 新增 35 项子任务、Skill fork、预置装配和兼容性测试。冻结锁文件安装及构建后“模型→文件工具→最终回答”检查已在一期首次验收通过。默认测试集另有 1 项显式跳过的真实模型测试；它需要 ENIO_API_KEY、ENIO_MODEL 和可选网关地址。下表区分代码能力、确定性测试与外部环境验收。
 
 | 验收项           | 测试位置                                                    | 当前覆盖                                                                                                               |
 | ---------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
@@ -18,7 +18,7 @@
 | A08 文件范围     | tests/filesystem.test.ts                                    | 绝对路径／穿越／符号链接／敏感文件／写目录白名单                                                                       |
 | A09 文件冲突     | tests/filesystem.test.ts                                    | 默认不覆盖、旧 hash 拒绝、精确匹配、并发写仅一个成功                                                                   |
 | A10 体积限制     | tests/filesystem.test.ts、runtime.test.ts、provider.test.ts | 二进制／大文件、遍历结果限量、UTF-8 截断、JSON 信封有效                                                                |
-| A11 inline Skill | tests/skills-process.test.ts                                | 元数据与正文分离、缺失 Skill、fork／agent／model 明确拒绝                                                              |
+| A11 inline Skill | tests/skills-process.test.ts                                | 元数据与正文分离、缺失 Skill、未配置 fork 注册表及 inline agent/model 覆盖拒绝                                         |
 | A12 事件消费     | tests/runtime.test.ts                                       | 提前关闭、模型清理、事件快照、观察回调故障隔离                                                                         |
 | A13 文件任务     | tests/demo.test.ts、tests/live.test.ts                      | 离线实际文件生成、事实与来源、回读、白名单产物通过；真实模型待配置                                                     |
 | A14 命令扩展     | tests/skills-process.test.ts                                | 默认不可用、参数字面量、环境限制、输出上限、超时和普通子进程组清理                                                     |
@@ -49,12 +49,28 @@
 
 `demo:v3` 使用两份真实仓库资料，展示中间件、失败切换、并发进度和直接交付。四个原有示例继续通过，覆盖文件报告、业务工具、项目指令，以及摘要／外置／中断恢复。`check` 脚本内部统一调用 Corepack，避免嵌套命令意外使用系统全局的旧 pnpm。
 
+## V4 验收
+
+V4 的具体行为验收如下，使用离线脚本模型与真实临时文件，不把确定性流程验收当作真实模型效果评测。
+
+| 验收项         | 测试位置                       | 覆盖                                                                                                         |
+| -------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| V401 隔离/事件 | tests/v4-subagents.test.ts     | 消息/todos 隔离、完整父历史继承、身份上下文、扁平路径、子直接返回、父子独立权限                              |
+| V402 中断/用量 | tests/v4-subagents.test.ts     | 三层新实例与文件存储恢复、连续中断、不重复写入、owner 绑定、缺失子检查点、全树 usage 差额                    |
+| V403 控制边界  | tests/v4-subagents.test.ts     | 消费提前结束、超时、子致命错误、深度/调用预算、输出预算、无终止事件、已完成子任务后的包装器错误、配置快照    |
+| V404 Skill     | tests/v4-skills-deep.test.ts   | fork 与 fork_with_context、文件发现、Agent/模型白名单、无隐式脚本权限、原正文恢复、路由变化拒绝、混合 inline |
+| V405 预置层    | tests/v4-skills-deep.test.ts   | 默认工具、显式文件/进程 backend、专用子任务、默认子任务恢复、关闭默认项、基础委派工具过滤                    |
+| V406 文件任务  | tests/v4-demo.test.ts          | 真实文件从 Skill 分析到 writer 子任务、确认暂停、新实例恢复、报告回读、父子 todos 隔离                       |
+| V407 V3 兼容   | tests/v4-compatibility.test.ts | 未修改 v3 标签实际生成的检查点，保留原 binding/setupSignature 直接恢复                                       |
+
+`demo:v4` 已验证资料读取 1 次、报告写入 1 次，展示 reviewer/writer 的独立事件和 writer 恢复事件。构建后直接从 `dist/index.js` 导入 AgentTool、TaskTool 和 DeepAgent，完成子运行和状态 JSON 往返。
+
 ## 尚未验证或明确不承诺
 
 - 真实模型端点尚未配置，未执行 live 集成测试，也未产生模型调用费用。
 - 本机验证为 macOS；Linux 的代码路径兼容设计尚需在目标环境运行同一测试集。Windows 进程扩展明确不支持。
 - 未做多租户隔离、恶意并发文件系统攻击或脱离进程组的进程清理保证；本地 backend 不是沙箱。
-- 已实现工具执行前的持久化中断恢复；未实现任意工具内部暂停、运行中崩溃自动续跑、业务审批系统、exactly-once、子 Agent、Graph、Workflow。文件领取使用 OS 排他创建；测试覆盖不同 store 实例竞争，未进行断电与磁盘故障注入。
+- 已实现工具执行前及子 Agent 调用链上的持久化中断恢复；未实现任意工具内部暂停、运行中崩溃自动续跑、业务审批系统、exactly-once、Graph、Workflow。文件领取使用 OS 排他创建；测试覆盖不同 store 实例竞争，未进行断电与磁盘故障注入。嵌套检查点逐层保存/领取，不提供跨 store 事务，孤立检查点的清理由宿主管理。
 - 未发布 npm 包或部署服务。依赖和构建产物按项目隔离；GitHub 源码仓库地址见 README。
 
 ## 复验
@@ -67,6 +83,7 @@ corepack pnpm run demo:business
 corepack pnpm run demo:instructions
 corepack pnpm run demo:context
 corepack pnpm run demo:v3
+corepack pnpm run demo:v4
 # 配置真实模型后显式执行：
 corepack pnpm run test:live
 ```

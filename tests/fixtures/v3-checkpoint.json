@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "id": "b6a6829c-943f-425f-bd46-6732654b4c5a",
+  "binding": "7e3e64ca2ff0832483d5e8d79bf4ca3ef50c54ace431be181f9b5e33cb8e5de5",
+  "runId": "13ca116e-4eee-47b6-be66-82d50be9874e",
+  "seq": 6,
+  "iteration": 1,
+  "toolCalls": 0,
+  "usage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "known": false
+  },
+  "state": {
+    "schemaVersion": 1,
+    "messages": [
+      {
+        "role": "user",
+        "content": "continue this V3 task"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "legacy-work",
+            "name": "work",
+            "arguments": "{}"
+          }
+        ]
+      }
+    ],
+    "todos": [],
+    "usedToolCallIds": ["legacy-work"]
+  },
+  "pendingCalls": [
+    {
+      "id": "legacy-work",
+      "name": "work",
+      "arguments": "{}"
+    }
+  ],
+  "projectInstructions": "",
+  "limits": {
+    "maxIterations": 20,
+    "maxToolCalls": 64,
+    "maxToolCallsPerRound": 8,
+    "runTimeoutMs": 120000,
+    "modelTimeoutMs": 60000,
+    "toolTimeoutMs": 30000,
+    "maxModelRetries": 2,
+    "retryDelayMs": 200,
+    "maxToolArgumentBytes": 32768,
+    "maxToolResultBytes": 32768,
+    "maxInputBytes": 1048576,
+    "maxModelResponseBytes": 1048576,
+    "maxToolStreamBytes": 1048576
+  },
+  "info": "confirm legacy work",
+  "modelIndex": 0,
+  "setupSignature": "{\"instructions\":\"V3 instructions\",\"tools\":[{\"name\":\"work\",\"description\":\"work\",\"inputSchema\":{\"type\":\"object\"}}],\"behaviors\":[[\"work\",\"read\",true,false]]}",
+  "availableTools": ["work"]
+}

@@ -20,6 +20,8 @@ import type {
   JsonValue,
   MiddlewareContext,
   ToolResult,
+  DelegationScope,
+  Usage,
 } from "../protocol/types.js";
 import { ToolRegistry } from "../tools/registry.js";
 import { callModel } from "./model-call.js";
@@ -27,7 +29,8 @@ import { selectBatch, runToolBatch } from "./tool-batch.js";
 import { abortable, byteLength, checkAbort, createScope, resolveLimits } from "./control.js";
 import { validateHistory, validateResponse } from "./history.js";
 import { assertJson, validateCheckpoint, validateSnapshot } from "./state.js";
-import { ToolInterrupt } from "./interrupt.js";
+import { AgentToolInterrupt, ToolInterrupt } from "./interrupt.js";
+import { inheritedHistory, validateDelegation } from "./delegation.js";
 
 /**
  * 创建可复用的单 Agent。配置错误在这里同步抛出；运行中的错误通过 run_end
@@ -42,6 +45,7 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
     contextPolicies: [...(configuration.contextPolicies ?? [])],
     middlewares: [...(configuration.middlewares ?? [])],
     toolExecution: { ...configuration.toolExecution },
+    delegation: { ...configuration.delegation },
     modelFailover: configuration.modelFailover
       ? { ...configuration.modelFailover, models: [...configuration.modelFailover.models] }
       : undefined,
@@ -56,6 +60,9 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
   const baseLimits = resolveLimits(config.limits);
   const baseRegistry = new ToolRegistry(config.tools ?? []);
   const maxConcurrency = config.toolExecution.maxConcurrency ?? 1;
+  const maxDepth = config.delegation.maxDepth ?? 4;
+  const maxAgentCalls = config.delegation.maxCalls ?? 32;
+  validateDelegation({ path: [], maxDepth, budget: { maxCalls: maxAgentCalls, calls: 0 } });
   if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 64)
     throw new AgentError("invalid_config", "maxConcurrency must be an integer between 1 and 64");
   if (
@@ -104,6 +111,12 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
     ...(config.middlewares.length ? { middlewares: [...middlewareNames] } : {}),
     ...(maxConcurrency > 1 ? { maxConcurrency } : {}),
     ...(config.modelFailover ? { fallbackCount: config.modelFailover.models.length } : {}),
+    ...(configuration.delegation ? { delegation: config.delegation } : {}),
+    ...((config.tools ?? []).some((tool) => tool.delegates)
+      ? {
+          delegates: (config.tools ?? []).filter((tool) => tool.delegates).map((tool) => tool.name),
+        }
+      : {}),
     ...((config.tools ?? []).some((tool) => tool.parallelSafe || tool.returnDirect)
       ? {
           behaviors: (config.tools ?? []).map((tool) => [
@@ -141,6 +154,13 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
     let restoredSetup: string | undefined;
     let availableTools: Set<string> | undefined;
     let activeModel = 0;
+    let delegation: DelegationScope = {
+      path: [],
+      maxDepth,
+      budget: { maxCalls: maxAgentCalls, calls: 0 },
+    };
+    const continuations = new Map<string, JsonValue>();
+    const childUsage = new Map<string, Usage & { known: boolean }>();
     let returnedDirectly = false;
     let runId = randomUUID() as string;
     let limits = baseLimits;
@@ -238,6 +258,19 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
       scope.dispose();
       scope = createScope(parent, limits.runTimeoutMs, "run_timeout");
       checkAbort(scope.signal);
+      if (options.delegation) {
+        validateDelegation(options.delegation);
+        // 共享的只有全树调用计数；路径另行复制，子级可以收紧最大深度。
+        delegation = {
+          path: structuredClone(options.delegation.path),
+          maxDepth: Math.min(
+            options.delegation.maxDepth,
+            config.delegation.maxDepth ?? options.delegation.maxDepth,
+          ),
+          budget: options.delegation.budget,
+        };
+        validateDelegation(delegation);
+      }
       if (config.checkpoints) bindingFor(options);
       if (resumeInput) {
         assertJson(resumeInput.data);
@@ -266,6 +299,27 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
           throw new AgentError("checkpoint_mismatch", "Checkpoint model index is not configured");
         restoredSetup = restored.setupSignature;
         availableTools = restored.availableTools ? new Set(restored.availableTools) : undefined;
+        Object.entries(restored.continuations ?? {}).forEach(([id, value]) =>
+          continuations.set(id, value),
+        );
+        Object.entries(restored.childUsage ?? {}).forEach(([id, value]) =>
+          childUsage.set(id, value),
+        );
+        if (restored.delegation) {
+          if (
+            JSON.stringify(restored.delegation.path) !== JSON.stringify(delegation.path) ||
+            restored.delegation.maxDepth !== delegation.maxDepth ||
+            restored.delegation.budget.maxCalls !== delegation.budget.maxCalls
+          )
+            throw new AgentError(
+              "checkpoint_mismatch",
+              "Agent invocation path or tree budget changed",
+            );
+          delegation.budget.calls = Math.max(
+            delegation.budget.calls,
+            restored.delegation.budget.calls,
+          );
+        }
         limits = resolveLimits(restored.limits, options.limits);
         scope.dispose();
         scope = createScope(parent, limits.runTimeoutMs, "run_timeout");
@@ -330,6 +384,7 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
           tool.effect,
           !!tool.parallelSafe,
           !!tool.returnDirect,
+          ...(tool.delegates ? [true] : []),
         ]),
       });
       if (restoredSetup !== undefined && restoredSetup !== setupSignature)
@@ -363,12 +418,52 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             config,
             limits,
             availableTools,
-            context: { runId, signal: scope.signal, context: options.context, state },
+            continuations,
+            context: {
+              runId,
+              signal: scope.signal,
+              context: options.context,
+              state,
+              delegation,
+              checkpointOwner: options.checkpointOwner,
+              ...(registry.behavior(batch[0]!.name).delegates
+                ? { messages: inheritedHistory(messages) }
+                : {}),
+            },
             ...(resumeId ? { resume: { id: resumeId, data: resumeData } } : {}),
           })) {
             if ("interrupt" in item) {
-              callsCount--; // 中断前尚未执行，不消耗工具额度。
+              // 尚未交付最终结果；恢复同一父调用时再计一次，子级已完成的步骤由其检查点保留。
+              callsCount--;
               interruptedCalls.set(item.call.id, item.interrupt);
+              if (item.interrupt instanceof AgentToolInterrupt)
+                continuations.set(item.call.id, structuredClone(item.interrupt.continuation));
+              continue;
+            }
+            if (item.chunk.type === "agent_event") {
+              const nested = item.chunk.event;
+              // 孙级用量已计入子级 run_end，只汇总直接子级，恢复后按累计值差额计入。
+              if (
+                item.chunk.path.length === delegation.path.length + 1 &&
+                nested.type === "run_end"
+              ) {
+                const current = nested.payload.result.usage;
+                const previous = childUsage.get(nested.runId) ?? {
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  known: true,
+                };
+                if (
+                  current.inputTokens < previous.inputTokens ||
+                  current.outputTokens < previous.outputTokens
+                )
+                  throw new AgentError("invalid_agent_event", "Child cumulative usage decreased");
+                usage.inputTokens += current.inputTokens - previous.inputTokens;
+                usage.outputTokens += current.outputTokens - previous.outputTokens;
+                usage.known &&= current.known;
+                childUsage.set(nested.runId, { ...current });
+              }
+              yield event("agent_event", { path: item.chunk.path, event: nested });
               continue;
             }
             if (item.chunk.type === "text_delta") {
@@ -387,6 +482,7 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
               content: JSON.stringify(result),
             });
             pending.delete(item.call.id);
+            continuations.delete(item.call.id);
             queue = queue.filter((call) => call.id !== item.call.id);
             if (item.call.id === resumeId) resumeData = undefined;
             yield event("tool_end", { id: item.call.id, name: item.call.name, result });
@@ -590,6 +686,9 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
             modelIndex: activeModel,
             ...(setupSignature ? { setupSignature } : {}),
             ...(availableTools ? { availableTools: [...availableTools] } : {}),
+            ...(continuations.size ? { continuations: Object.fromEntries(continuations) } : {}),
+            delegation: structuredClone(delegation),
+            ...(childUsage.size ? { childUsage: Object.fromEntries(childUsage) } : {}),
           };
           await abortable(config.checkpoints!.store.save(checkpoint, scope.signal), scope.signal);
           interrupted = { checkpointId, call: structuredClone(queue[0]!), info: cause.info };
@@ -597,7 +696,10 @@ export function createAgent<C = Record<string, never>>(configuration: AgentConfi
         } catch (saveError) {
           error = toAgentError(saveError);
         }
-      } else error = toAgentError(cause);
+      } else {
+        if (queue.some((call) => registry.behavior(call.name).delegates)) usage.known = false;
+        error = toAgentError(cause);
+      }
     } finally {
       scope.cancel();
       scope.dispose();

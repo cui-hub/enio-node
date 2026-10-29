@@ -2,6 +2,10 @@
 export * from "./protocol/types.js";
 export * from "./protocol/errors.js";
 export { createAgent } from "./runtime/agent.js";
+export { createAgentTool, createTaskTool } from "./builtins/agent.js";
+export type { AgentToolOptions } from "./builtins/agent.js";
+export { createDeepAgent } from "./prebuilt/deep.js";
+export type { DeepAgentConfig } from "./prebuilt/deep.js";
 export { DEFAULT_LIMITS } from "./runtime/control.js";
 export { defineTool } from "./tools/registry.js";
 export { createScriptedModel } from "./model/scripted.js";
