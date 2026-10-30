@@ -4,7 +4,7 @@
 
 项目仓库：[cui-hub/enio-node](https://github.com/cui-hub/enio-node)。建议结合源码注释、架构文档和离线示例理解模型调用、工具执行与运行时控制的完整链路。
 
-已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。V2 增加历史摘要、工具结果外置、工作状态导出和工具执行前的持久化中断恢复；V3 增加生命周期中间件、模型／工具包装器、工具流式输出、受控并发、工具直接返回及主模型故障切换。V4 增加 AgentTool、子任务隔离、嵌套事件和中断恢复、Skill fork，以及 DeepAgent 风格的预置装配。Graph、Workflow 与业务审批系统留到后续阶段。
+已提供：Agent Loop、统一工具接口、OpenAI-compatible Chat Completions 适配器、流式事件、取消／超时／预算、文件工具、待办、Skill、AGENTS.md 项目指令加载，以及显式启用的命令执行扩展。V2 增加历史摘要、工具结果外置、工作状态导出和工具执行前的持久化中断恢复；V3 增加生命周期中间件、模型／工具包装器、工具流式输出、受控并发、工具直接返回及主模型故障切换。V4 增加 AgentTool、子任务隔离、嵌套事件和中断恢复、Skill fork，以及 DeepAgent 风格的预置装配；进一步提供共享角色注册表、三种可选角色预设和 TOML 业务 Agent 定义。Graph、Workflow 与业务审批系统留到后续阶段。
 
 ## 快速运行
 
@@ -216,6 +216,29 @@ AGENTS.md 中可引用其他文件，例如：
 
 这些能力均按需启用；具体调用顺序、代码示例、恢复兼容性与边界见 [V3 单 Agent 指南](docs/v3-single-agent.md)。可运行代码见 [examples/single-agent-v3.ts](examples/single-agent-v3.ts)。
 
+## 共享角色与 TOML 业务 Agent
+
+`createAgentPreset(name, config)` 提供 `general-purpose`、`explorer`、`worker` 三种可选角色；`explorer` 仅保留只读工具，所有预设默认排除委派工具。业务仍提供模型、backend 和权限。
+
+```typescript
+const registry = createAgentRegistry({
+  defaultAgent: "general-purpose",
+  roles: [
+    createAgentPreset("general-purpose", defaults),
+    createAgentPreset("explorer", defaults),
+    createAgentPreset("worker", defaults),
+    ...(await loadAgentRoles({ root: ".enio/agents", defaults, models: { fast: fastModel } })),
+  ],
+});
+const skillTool = await createSkillTool({ backend: skillsBackend, fork: { registry } });
+const agent = createDeepAgent({ model, registry, tools: [skillTool] });
+// 普通 Agent 也可通过 createTaskTool({ registry }) 接入同一份角色目录。
+```
+
+上述工厂均从包入口导出；`defaults` 是包含模型和工具的宿主 `AgentConfig`。TOML 必填 `name`、`description`、`developer_instructions`，可选 `preset`、`model`、`tools`、`history`。模型别名和工具只从宿主白名单选择，不从文件创建凭证或执行器。Skill 仍通过 tools 注册。
+
+新旧接入方式兼容；共享注册表模式下 DeepAgent 不会另加默认通用角色。详见 [共享角色与 TOML 指南](docs/agent-roles.md)，可运行 `pnpm run demo:roles`。
+
 ## 流式事件与运行结果
 
 V4 子任务通过 `agent_event` 返回 `{path, event}`，内层事件保持子 runId/seq；父模型只收到子 finalText。完整 API、UML、调用时序和示例见 [V4 子 Agent 指南](docs/v4-subagents.md)。
@@ -264,6 +287,7 @@ for await (const event of agent.stream(
 - [架构与扩展方式](docs/architecture.md)：模块依赖、循环和取消链路。
 - [V3 单 Agent 指南](docs/v3-single-agent.md)：中间件、工具流、并发、直接返回与模型切换。
 - [V4 子 Agent 指南](docs/v4-subagents.md)：AgentTool、隔离、嵌套事件与恢复、Skill fork、DeepAgent 装配。
+- [共享角色与 TOML 指南](docs/agent-roles.md)：三种可选预设、task/Skill 共享配置、TOML 自定义业务角色。
 - [长上下文与恢复指南](docs/context-and-resume.md)：摘要、外置、快照、中断与存储契约。
 - [验收记录](docs/acceptance.md)：各阶段对应测试与未验证部分。
 - [Eino 源码](https://github.com/cloudwego/eino)：参考框架，可对照理解 Go 与 TypeScript 的实现方式。

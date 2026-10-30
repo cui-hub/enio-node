@@ -2,6 +2,8 @@
 
 V4 在现有 Agent Loop 上增加子任务层：`createAgentTool` 把独立 Agent 变成普通工具，`createTaskTool` 提供命名路由，Skill 可以在子 Agent 中执行，`createDeepAgent` 负责常见工具组合。核心循环仍只有 `src/runtime/agent.ts` 一份。Chain、Workflow、Graph 留在 V5。
 
+后续扩展提供 `createAgentRegistry`，让 task 与 Skill 共用角色配置；可选预设与 TOML 业务角色的接入、默认值和兼容边界见 [共享角色与 TOML 指南](agent-roles.md)。下方旧实例列表与 fork.agents 示例仍然有效。
+
 这是对 Eino 核心行为的独立 TypeScript 实现，参考 `adk/agent_tool.go`、`adk/prebuilt/deep/` 和 `adk/middlewares/skill/`。不兼容其 Go API、事件 Action 或序列化检查点，也未实现 Eino 的动态 transfer/supervisor 全套编排。
 
 ## 对象和依赖
@@ -49,6 +51,7 @@ classDiagram
   }
   class SkillForkOptions {
     agents: AgentConfigRegistry
+    registry: AgentRegistry
     models: ChatModelRegistry
     defaultAgent: string
   }
@@ -56,8 +59,19 @@ classDiagram
     filesystem: FileSystemBackend
     execute: ExecuteBackend
     subAgents: AgentToolOptions[]
+    registry: AgentRegistry
     generalAgent: boolean
     todos: boolean
+  }
+  class AgentRole {
+    name: string
+    description: string
+    config: AgentConfig
+  }
+  class AgentRegistry {
+    defaultAgent: string
+    list() AgentRole[]
+    get(name) AgentRole
   }
   Agent --> AgentConfig : createAgent
   AgentConfig o-- Tool
@@ -68,9 +82,13 @@ classDiagram
   Checkpoint --> DelegationScope
   Agent ..> Checkpoint : save / take
   SkillForkOptions --> AgentConfig : 宿主白名单
+  AgentRegistry o-- AgentRole
+  AgentRole --> AgentConfig
+  SkillForkOptions --> AgentRegistry : 或共享角色
   SkillForkOptions ..> AgentToolOptions : fork 适配
   DeepAgentConfig --|> AgentConfig
   DeepAgentConfig --> AgentToolOptions
+  DeepAgentConfig --> AgentRegistry : 或共享角色
   DeepAgentConfig ..> Agent : createDeepAgent
 ```
 
@@ -276,6 +294,8 @@ const agent = createDeepAgent({
 默认添加 write_todos 和 task，task 内包含 general-purpose。通用子 Agent 继承宿主的模型、基础工具、ACL、hooks、中间件及上下文策略，排除基础列表里 delegates=true 的工具以避免隐式递归，并使用 `/general-purpose` 检查点 namespace。宿主的 beforeAgent 中间件若动态新增委派工具，仍受全树预算控制。专用子 Agent 使用传入的实例，不自动获得父工具或父 ACL。
 
 `todos: false` 关闭自动待办；`generalAgent: false` 关闭默认通用子任务。没有任何子任务时不注册 task。工具同名会报错，自定义 general-purpose 时需关闭默认项。调用方可只传 model 使用预置分析助手，文件与进程能力都须显式提供 backend。
+
+上述默认规则针对未传 registry 的旧入口。传入 `registry` 时，task 名单完全由共享角色决定，`generalAgent` 默认 false；不能同时配置非空 subAgents 或 `generalAgent: true`。需要通用角色时，把 `createAgentPreset("general-purpose", config)` 显式加入注册表。
 
 ## 可运行示例与验证
 

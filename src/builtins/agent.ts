@@ -19,6 +19,8 @@ import {
   validatePath,
 } from "../runtime/delegation.js";
 import { validateHistory } from "../runtime/history.js";
+import { createAgent } from "../runtime/agent.js";
+import type { AgentRegistry } from "../agents/registry.js";
 
 /** 子 Agent 是宿主提供的实例；工具名/描述进入父模型，身份和模型配置不会成为参数。 */
 export interface AgentToolOptions<C> {
@@ -178,12 +180,39 @@ export function createAgentTool<C = unknown>(
   });
 }
 
+/** 旧实例列表与共享角色注册表二选一，避免同名配置被静默覆盖。 */
+export type TaskToolOptions<C> =
+  | { agents: AgentToolOptions<C>[]; registry?: never }
+  | { registry: AgentRegistry<C>; agents?: never };
+
 /** 一组命名子 Agent 共用 task 工具，模型只能选择宿主注册的名称。 */
-export function createTaskTool<C = unknown>({
-  agents,
-}: {
-  agents: AgentToolOptions<C>[];
-}): Tool<{ agent: string; request: string }, C> {
+export function createTaskTool<C = unknown>(
+  options: TaskToolOptions<C>,
+): Tool<{ agent: string; request: string }, C> {
+  if (options.registry !== undefined && options.agents !== undefined)
+    throw new AgentError("invalid_config", "Choose either task agents or a shared registry");
+  // 共享配置不共享运行状态；为 task 单独派生 namespace，不能误领 Skill 的检查点。
+  const agents = options.registry
+    ? options.registry.list().map(({ name, description, config, history, effect }) => ({
+        name,
+        description,
+        history,
+        effect,
+        agent: createAgent({
+          ...config,
+          ...(config.checkpoints
+            ? {
+                checkpoints: {
+                  ...config.checkpoints,
+                  namespace: `${config.checkpoints.namespace}/task/${name}`,
+                },
+              }
+            : {}),
+        }),
+      }))
+    : options.agents;
+  if (!Array.isArray(agents))
+    throw new AgentError("invalid_config", "Task tool requires agents or a shared registry");
   if (!agents.length)
     throw new AgentError("invalid_config", "Task tool requires at least one child Agent");
   const tools = new Map(agents.map((entry) => [entry.name, createAgentTool(entry)]));

@@ -15,13 +15,14 @@ import { LocalFileStore } from "../backends/local-filesystem.js";
 import { createAgent } from "../runtime/agent.js";
 import { AgentToolInterrupt } from "../runtime/interrupt.js";
 import { createAgentTool } from "../builtins/agent.js";
+import type { AgentRegistry } from "../agents/registry.js";
 
 /** name/description 在创建时发现，正文仅在 skill 工具被调用时进入模型上下文。 */
 export interface SkillMetadata {
   name: string;
   description: string;
   context?: "inline" | "fork" | "fork_with_context";
-  /** 只允许选择宿主 fork.agents / fork.models 中的键，不能提供任意配置或凭证。 */
+  /** agent 只选择 fork.registry 或 fork.agents 的名称；model 只选择 fork.models 的键。 */
   agent?: string;
   model?: string;
 }
@@ -137,11 +138,13 @@ export function createFilesystemSkills({ root }: { root: string }): SkillBackend
 }
 
 /** Skill fork 只选择宿主提供的配置，不从 Markdown 构造客户端或授予执行权限。 */
-export interface SkillForkOptions<C> {
-  agents: Record<string, AgentConfig<C>>;
+export type SkillForkOptions<C> = {
   defaultAgent?: string;
   models?: Record<string, ChatModel>;
-}
+} & (
+  | { agents: Record<string, AgentConfig<C>>; registry?: never }
+  | { registry: AgentRegistry<C>; agents?: never }
+);
 export interface SkillToolOptions<C> {
   backend: SkillBackend;
   signal?: AbortSignal;
@@ -178,10 +181,20 @@ export async function createSkillTool<C = unknown>({
       "unsupported_skill",
       "Fork skills require an explicit host Agent registry",
     );
-  const agentConfigs = new Map(Object.entries(fork?.agents ?? {}));
+  if (fork?.registry !== undefined && fork.agents !== undefined)
+    throw new AgentError("invalid_config", "Choose either Skill agents or a shared registry");
+  const agentConfigs = new Map(
+    fork?.registry
+      ? fork.registry.list().map((role) => [role.name, role.config] as const)
+      : Object.entries(fork?.agents ?? {}),
+  );
   const models = new Map(Object.entries(fork?.models ?? {}));
   const defaultAgent =
-    fork?.defaultAgent ?? (agentConfigs.size === 1 ? [...agentConfigs.keys()][0] : undefined);
+    fork?.defaultAgent ??
+    fork?.registry?.defaultAgent ??
+    (agentConfigs.size === 1 ? [...agentConfigs.keys()][0] : undefined);
+  if (defaultAgent !== undefined && !agentConfigs.has(defaultAgent))
+    throw new AgentError("invalid_skill", "Default fork Agent is not registered");
   const children = new Map<string, Agent<C>>();
   const routes = new Map<string, { name: string; signature: string }>();
   const routeOf = (skill: SkillMetadata) =>

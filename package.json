@@ -33,12 +33,14 @@
     "demo:live": "tsx examples/file-report.ts --live",
     "check": "corepack pnpm run format:check && corepack pnpm run typecheck && corepack pnpm run test && corepack pnpm run build",
     "demo:v3": "tsx examples/single-agent-v3.ts",
-    "demo:v4": "tsx examples/subagents-v4.ts"
+    "demo:v4": "tsx examples/subagents-v4.ts",
+    "demo:roles": "tsx examples/agent-roles.ts"
   },
   "dependencies": {
     "ajv": "8.20.0",
     "openai": "7.34.0",
     "picomatch": "4.0.7",
+    "smol-toml": "1.9.1",
     "yaml": "2.9.1"
   },
   "devDependencies": {

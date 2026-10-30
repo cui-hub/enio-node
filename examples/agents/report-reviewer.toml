@@ -1,0 +1,10 @@
+# 一个文件定义一个业务角色；model 和 tools 都引用宿主提供的实例。
+name = "report-reviewer"
+description = "阅读指标资料，返回带来源的报告草稿"
+preset = "explorer"
+model = "review"
+tools = ["read_file", "ls", "glob", "grep"]
+developer_instructions = """
+读取 fixtures/metrics.md 中的指标资料。
+输出报告草稿，标注来源路径；不要修改文件。
+"""

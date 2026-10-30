@@ -8,15 +8,18 @@ import { createExecuteTool } from "../builtins/execute.js";
 import { createTaskTool } from "../builtins/agent.js";
 import type { AgentToolOptions } from "../builtins/agent.js";
 import { AgentError } from "../protocol/errors.js";
+import type { AgentRegistry } from "../agents/registry.js";
 
 /** 预置层只负责装配，继续使用同一个 Agent Loop；不创建第二套调度器或状态存储。 */
 export interface DeepAgentConfig<C> extends AgentConfig<C> {
   filesystem?: FileSystemBackend;
   execute?: ExecuteBackend;
   subAgents?: AgentToolOptions<C>[];
+  /** 使用共享角色时由注册表完整定义 task 名单；同时传给 Skill 的 fork.registry。 */
+  registry?: AgentRegistry<C>;
   /** 默认注册 write_todos；宿主自行提供同名工具时应关闭此项。 */
   todos?: boolean;
-  /** 默认提供无递归委派工具的通用子 Agent；专用子 Agent 由 subAgents 显式提供。 */
+  /** 未提供 registry 时默认为 true；共享注册表模式下默认 false，不能显式打开。 */
   generalAgent?: boolean;
 }
 
@@ -41,12 +44,15 @@ export function createDeepAgent<C = Record<string, never>>(
     filesystem,
     execute,
     subAgents = [],
+    registry,
     todos = true,
-    generalAgent = true,
+    generalAgent = registry === undefined,
     ...base
   } = configuration;
   if (typeof todos !== "boolean" || typeof generalAgent !== "boolean" || !Array.isArray(subAgents))
     throw new AgentError("invalid_config", "Invalid DeepAgent assembly options");
+  if (registry && (generalAgent || subAgents.length))
+    throw new AgentError("invalid_config", "Shared registry cannot be mixed with legacy subAgents");
   const tools: Tool<unknown, C>[] = [
     ...(base.tools ?? []),
     ...(filesystem ? createFileTools<C>({ backend: filesystem }) : []),
@@ -79,10 +85,13 @@ export function createDeepAgent<C = Record<string, never>>(
       }),
     });
   }
-  if (children.length) tools.push(createTaskTool({ agents: children }));
+  if (registry) tools.push(createTaskTool({ registry }));
+  else if (children.length) tools.push(createTaskTool({ agents: children }));
   return createAgent({
     ...base,
     tools,
-    instructions: [instruction, ...(children.length ? [TASK_INSTRUCTIONS] : [])].join("\n\n"),
+    instructions: [instruction, ...(registry || children.length ? [TASK_INSTRUCTIONS] : [])].join(
+      "\n\n",
+    ),
   });
 }

@@ -8,6 +8,12 @@ flowchart TD
   App --> Deep[createDeepAgent / 预置装配]
   Deep --> Runtime
   Deep --> Task[AgentTool / task]
+  App --> Roles[AgentRegistry / 共享角色配置]
+  TOML[loadAgentRoles / TOML] --> Roles
+  Presets[createAgentPreset / 可选预设] --> Roles
+  Roles --> Task
+  Roles --> SkillFork[Skill fork]
+  SkillFork --> Runtime
   Runtime --> Protocol[protocol 类型与错误]
   Runtime --> Registry[ToolRegistry / ToolExecutor]
   Runtime --> ModelCall[模型尝试 / 重试 / 切换]
