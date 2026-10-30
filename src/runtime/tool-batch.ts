@@ -56,6 +56,7 @@ export async function* runToolBatch<C>(input: {
   config: AgentConfig<C>;
   limits: Limits;
   availableTools?: ReadonlySet<string>;
+  continuations?: ReadonlyMap<string, import("../protocol/types.js").JsonValue>;
 }): AsyncGenerator<BatchItem> {
   const controller = new AbortController();
   const signal = AbortSignal.any([input.context.signal, controller.signal]);
@@ -68,6 +69,9 @@ export async function* runToolBatch<C>(input: {
         signal,
         toolCallId: call.id,
         state: input.calls.length > 1 ? readonlyState(input.context.state) : input.context.state,
+        ...(input.continuations?.has(call.id)
+          ? { continuation: structuredClone(input.continuations.get(call.id)!) }
+          : {}),
         ...(input.resume?.id === call.id ? { resume: input.resume.data } : {}),
       },
       input.config,

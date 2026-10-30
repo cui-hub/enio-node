@@ -1,23 +1,11 @@
 import { AgentError } from "../protocol/errors.js";
-import type { AgentSnapshot, Checkpoint, JsonValue, RunResult } from "../protocol/types.js";
+import type { AgentSnapshot, Checkpoint, RunResult } from "../protocol/types.js";
 import { byteLength, resolveLimits } from "./control.js";
 import { validateHistory } from "./history.js";
 
-/** JSON 往返前拒绝会静默丢失的值、原型对象与循环引用，避免损坏恢复状态。 */
-export function assertJson(
-  value: unknown,
-  ancestors = new Set<unknown>(),
-): asserts value is JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
-  if (typeof value === "number" && Number.isFinite(value)) return;
-  if (typeof value !== "object" || ancestors.has(value))
-    throw new AgentError("invalid_state", "State must contain finite, acyclic JSON data");
-  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype)
-    throw new AgentError("invalid_state", "State must contain plain objects");
-  ancestors.add(value);
-  for (const item of Object.values(value)) assertJson(item, ancestors);
-  ancestors.delete(value);
-}
+import { assertJson } from "./json.js";
+export { assertJson } from "./json.js";
+import { validateChildUsage, validateDelegation } from "./delegation.js";
 
 /** 公开快照只接受完整的 assistant/tool 配对，不能用它绕过检查点恢复。 */
 export function validateSnapshot(value: AgentSnapshot): AgentSnapshot {
@@ -108,6 +96,27 @@ export function validateCheckpoint(value: Checkpoint): Checkpoint {
   )
     throw new AgentError("invalid_checkpoint", "Invalid V3 checkpoint metadata");
   resolveLimits(value.limits);
+  if (value.delegation !== undefined) validateDelegation(value.delegation);
+  if (value.continuations !== undefined) {
+    if (
+      !value.continuations ||
+      Array.isArray(value.continuations) ||
+      typeof value.continuations !== "object" ||
+      Object.keys(value.continuations).some(
+        (id) => !value.pendingCalls.some((call) => call.id === id),
+      )
+    )
+      throw new AgentError("invalid_checkpoint", "Continuation must belong to a pending tool");
+  }
+  if (value.childUsage !== undefined) {
+    if (
+      !value.childUsage ||
+      Array.isArray(value.childUsage) ||
+      typeof value.childUsage !== "object"
+    )
+      throw new AgentError("invalid_checkpoint", "Invalid child usage ledger");
+    Object.values(value.childUsage).forEach(validateChildUsage);
+  }
   const pending = new Map<string, unknown>();
   for (const message of value.state.messages) {
     if (message.role === "assistant")

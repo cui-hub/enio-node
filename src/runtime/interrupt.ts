@@ -13,3 +13,14 @@ export class ToolInterrupt extends Error {
     super("Tool interrupted before execution");
   }
 }
+
+/** 仅在子 Agent 已保存检查点后传播。它携带引用，不代表任意工具调用栈可恢复。 */
+export class AgentToolInterrupt extends ToolInterrupt {
+  constructor(
+    info: JsonValue,
+    public readonly continuation: JsonValue,
+  ) {
+    super(info);
+    assertJson(continuation);
+  }
+}

@@ -80,7 +80,9 @@ export class ToolRegistry<C> {
         (original.stream !== undefined && typeof original.stream !== "function") ||
         (original.parallelSafe !== undefined && typeof original.parallelSafe !== "boolean") ||
         (original.parallelSafe === true && original.effect !== "read") ||
-        (original.returnDirect !== undefined && typeof original.returnDirect !== "boolean")
+        (original.returnDirect !== undefined && typeof original.returnDirect !== "boolean") ||
+        (original.delegates !== undefined && typeof original.delegates !== "boolean") ||
+        (original.delegates && original.parallelSafe)
       ) {
         throw new AgentError("invalid_config", `Invalid tool definition: ${original.name}`);
       }
@@ -124,9 +126,13 @@ export class ToolRegistry<C> {
   }
 
   /** 调度元数据不暴露执行函数；未知工具仍由 prepare 生成可回填错误。 */
-  behavior(name: string): { parallelSafe: boolean; returnDirect: boolean } {
+  behavior(name: string): { parallelSafe: boolean; returnDirect: boolean; delegates: boolean } {
     const tool = this.entries.get(name)?.tool;
-    return { parallelSafe: tool?.parallelSafe === true, returnDirect: tool?.returnDirect === true };
+    return {
+      parallelSafe: tool?.parallelSafe === true,
+      returnDirect: tool?.returnDirect === true,
+      delegates: tool?.delegates === true,
+    };
   }
 
   /** 模型可见集合可以收窄，但不能伪造未注册工具或改变其参数契约。 */

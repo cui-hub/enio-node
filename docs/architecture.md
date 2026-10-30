@@ -5,6 +5,15 @@
 ```mermaid
 flowchart TD
   App[业务宿主 / CLI] --> Runtime[createAgent / 单 Agent Loop]
+  App --> Deep[createDeepAgent / 预置装配]
+  Deep --> Runtime
+  Deep --> Task[AgentTool / task]
+  App --> Roles[AgentRegistry / 共享角色配置]
+  TOML[loadAgentRoles / TOML] --> Roles
+  Presets[createAgentPreset / 可选预设] --> Roles
+  Roles --> Task
+  Roles --> SkillFork[Skill fork]
+  SkillFork --> Runtime
   Runtime --> Protocol[protocol 类型与错误]
   Runtime --> Registry[ToolRegistry / ToolExecutor]
   Runtime --> ModelCall[模型尝试 / 重试 / 切换]
@@ -22,7 +31,11 @@ flowchart TD
   Provider[OpenAI-compatible / ScriptedModel] -.实现.-> Model
   Files[文件工具] -.注册.-> Registry
   Todo[待办工具] -.注册.-> Registry
-  Skill[inline Skill 工具] -.注册.-> Registry
+  Skill[inline / fork Skill 工具] -.注册.-> Registry
+  Task -.注册.-> Registry
+  Task --> Child[子 Agent / 同一 Loop 实现]
+  Skill --> Task
+  Runtime --> Delegation[路径 / 共享预算 / 子恢复引用]
   Execute[可选 execute 工具] -.注册.-> Registry
   Files --> FS[FileSystemBackend]
   FS --> Local[LocalFileStore]
@@ -48,7 +61,10 @@ flowchart TD
 | src/backends/filesystem.ts         | 两类存储共享的权限、查询、冲突与锁语义             |
 | src/backends/local-filesystem.ts   | 路径分量校验、受限读取、排他创建和原子替换         |
 | src/backends/memory.ts             | 可重复的离线存储实现                               |
-| src/skills/skills.ts               | 元数据发现、inline 正文加载和配置拒绝              |
+| src/skills/skills.ts               | 元数据发现、inline 正文加载、fork 路由和恢复       |
+| src/builtins/agent.ts              | AgentTool 和 task 路由、事件转发、子中断适配       |
+| src/prebuilt/deep.ts               | 预置指令、基础工具与子任务装配                     |
+| src/runtime/delegation.ts          | 运行树路径/预算、继承历史和嵌套事件校验            |
 | src/instructions/agents-md.ts      | 项目指令来源协议、引用展开、去重、告警与字节预算   |
 | src/backends/local-agents-md.ts    | 把 LocalFileStore 接入项目指令加载器               |
 | src/backends/process.ts            | 显式授权、shell=false、有界输出和进程组清理        |
@@ -135,6 +151,8 @@ Schema 的类型不会自动推导到泛型 A；作者须保持二者一致，�
 
 ## 后续阶段
 
-本阶段已覆盖版本化状态、工具执行前的中断恢复、摘要与长结果外置。业务审批界面、幂等与补偿、隔离 backend、MCP 和动态工具发现按需补充。子 Agent／Workflow／Graph 应独立设计执行与恢复语义，不把当前循环改成隐藏编排器。
+V4 将子 Agent 适配为工具，沿用同一循环、鉴权、中间件和结果处理链路；新增嵌套事件、子检查点引用和全树调用预算。预置层负责组合已有配置，不引入第二套运行器。完整对象图和调用链见 [V4 子 Agent 指南](v4-subagents.md)。
+
+后续 V5 再实现 Chain／Workflow／Graph。业务审批界面、幂等与补偿、隔离 backend、MCP 和动态工具发现按需补充。
 
 参考源码：Eino commit `58d184303f4e73413c454a9626f79c17af0fd9fb` 的 `adk/chatmodel.go`、`adk/react.go`、`compose/tool_node.go`、`components/tool/interface.go` 及 `adk/middlewares/`。当前代码为独立 TypeScript 实现，没有复制其 Go 图执行器。
